@@ -1,31 +1,32 @@
 {
-  "product": "phone",
+  "schema_version": 1,
+  "product": "Brunei",
   "coordinate_system": {
     "reference_image": "artifacts/reference/reference_aligned.png",
-    "note": "All ROI coordinates are defined after product alignment. Replace example values after Phase 2 ROI annotation."
+    "image_width": 0,
+    "image_height": 0,
+    "note": "All ROI coordinates use the aligned reference-image coordinate system. Use tools/annotate_rois.py to generate real values."
   },
   "screw_slots": [
     {
       "id": "S01",
       "roi": [100, 100, 160, 160],
-      "expected": "screw"
+      "expected": "screw",
+      "enabled": true
     },
     {
-      "id": "S02",
+      "id": "E01",
       "roi": [300, 100, 160, 160],
-      "expected": "screw"
-    },
-    {
-      "id": "S03",
-      "roi": [500, 100, 160, 160],
-      "expected": "empty"
+      "expected": "empty",
+      "enabled": true
     }
   ],
   "spring_regions": [
     {
-      "id": "SPRING_MAIN",
+      "id": "SPRING01",
       "roi": [100, 400, 600, 400],
-      "expected_count": 0
+      "expected_count": 0,
+      "enabled": true
     }
   ]
 }
