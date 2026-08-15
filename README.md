@@ -1,17 +1,15 @@
 # ProductAlignInspector
 
-工业装配完整性检测项目。当前第一阶段先解决一个基础问题：**产品在高分辨率图片中的位置不固定，但产品本体始终完整出现在画面内。**
+工业装配完整性检测项目。当前目标是：产品在高分辨率图片中的位置可以变化，但产品始终完整出现在画面内；系统先自动对齐到标准坐标，再检查螺丝、空孔、弹簧等固定装配位置。
 
 目标流程：
 
 ```text
 高分辨率原图
     ↓
-产品自动定位
+产品自动定位 / SIFT 配准
     ↓
-粗对齐（平移 / 旋转 / 尺度）
-    ↓
-ECC 精配准到标准 GOOD 参考图
+ECC 小范围精配准
     ↓
 标准坐标系
     ↓
@@ -24,22 +22,10 @@ PASS / NG
 
 ## 当前阶段
 
-Phase 1：产品定位与对齐。
+- Phase 1：产品自动定位与对齐 ✅
+- Phase 2：ROI 标注 ✅ 当前进行
 
-这一阶段暂时不训练 YOLO、PatchCore 或分类网络。先把所有图片统一到同一个产品坐标系，后续螺丝和弹簧就可以在固定 ROI 内检测，从而显著降低对缺陷数据量的要求。
-
-## 为什么这样做
-
-当前图像特点：
-
-- 产品一定完整出现在画面中；
-- 产品 X/Y 位置不固定；
-- 允许存在少量旋转；
-- 背景大面积为亮色；
-- 画面边缘可能存在暗角；
-- 原图分辨率较高，小零件不应该先把整图强制缩到 640×640。
-
-因此定位阶段采用 OpenCV 几何方法，而不是依赖神经网络学习位置变化。
+先把所有图片统一到同一个产品坐标系，再在标准参考图上定义固定 ROI。这样后续螺丝和弹簧检测不需要学习产品在整张图里的位置变化，可以显著减少缺陷数据需求。
 
 ## 安装
 
@@ -57,17 +43,17 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
-但运行 `tools/` 下脚本时推荐使用 `pip install -e .`，这样项目包会以 editable 模式安装。
+`tools/` 下脚本已经支持直接运行，即使没有先执行 `pip install -e .` 也能找到项目包。
 
 ## 1. 创建标准参考图
 
-选择一张结构正确、姿态较好的 GOOD 图片：
+例如：
 
-```bash
-python tools/create_reference.py --input D:\data\good\good_001.png --output artifacts\reference
+```bat
+python tools\create_reference.py --input "D:\Brunei\good.bmp" --output "artifacts\reference"
 ```
 
-会输出：
+输出：
 
 ```text
 artifacts/reference/
@@ -78,50 +64,115 @@ artifacts/reference/
 
 ## 2. 对齐单张图片
 
-```bash
-python tools/align_image.py ^
-  --input D:\data\test\test_001.png ^
-  --reference artifacts\reference\reference_aligned.png ^
-  --output artifacts\aligned
+```bat
+python tools\align_image.py --input "D:\Brunei\test.bmp" --reference "artifacts\reference\reference_aligned.png" --output "artifacts\test_align"
 ```
 
-输出包含：
+输出：
 
 ```text
-aligned.png       # 最终标准化图像
-coarse.png        # 粗对齐结果
+aligned.png
+coarse.png
 foreground_mask.png
-alignment.json    # 定位和 ECC 信息
-overlay.png       # 与参考图叠加，方便肉眼检查
+alignment.json
+overlay.png
 ```
+
+`overlay.png` 用来肉眼检查标准参考图与当前图片是否真正重合。
 
 ## 3. 批量对齐数据集
 
-```bash
-python tools/align_folder.py ^
-  --input-dir D:\data\phone ^
-  --reference artifacts\reference\reference_aligned.png ^
-  --output-dir artifacts\phone_aligned
+```bat
+python tools\align_folder.py --input-dir "D:\Brunei\dataset" --reference "artifacts\reference\reference_aligned.png" --output-dir "artifacts\aligned_dataset"
 ```
 
 脚本会递归处理子目录，并生成 `alignment_report.csv`。单张失败不会中断整个批处理。
 
-## 4. ROI 配置
+## 4. ROI 标注
 
-`configs/product.example.json` 用来描述标准坐标中的螺丝孔位和弹簧区域。后续 WinForms 只需要加载产品配置，并在对齐图上裁固定 ROI。
+打开标准参考图：
+
+```bat
+python tools\annotate_rois.py --image "artifacts\reference\reference_aligned.png" --output "configs\brunei.json" --product "Brunei"
+```
+
+操作方式：
+
+```text
+鼠标左键拖动  画一个 ROI
+S             保存为“这里应该有螺丝”
+E             保存为“这里应该为空”
+P             保存为弹簧区域，并在终端输入期望弹簧数量
+C             取消当前未保存 ROI
+U             撤销
+W             保存 JSON + 预览图
+Q / ESC       退出
+```
+
+例如一个螺丝位：先用鼠标框住螺丝及周围少量背景，然后按 `S`。
+
+如果某个孔标准状态应该没有螺丝：框住该孔后按 `E`。
+
+弹簧建议先框“整个需要计数的弹簧区域”，然后按 `P`，终端会要求输入标准弹簧数量。
+
+保存后得到：
+
+```text
+configs/brunei.json
+configs/brunei_preview.png
+```
+
+所有 ROI 坐标都使用 `reference_aligned.png` 的原始像素坐标，不使用缩小后的屏幕坐标。
+
+## ROI 配置示例
+
+```json
+{
+  "schema_version": 1,
+  "product": "Brunei",
+  "coordinate_system": {
+    "reference_image": ".../reference_aligned.png",
+    "image_width": 3200,
+    "image_height": 1800
+  },
+  "screw_slots": [
+    {
+      "id": "S01",
+      "roi": [1000, 500, 180, 180],
+      "expected": "screw",
+      "enabled": true
+    },
+    {
+      "id": "E01",
+      "roi": [1400, 500, 180, 180],
+      "expected": "empty",
+      "enabled": true
+    }
+  ],
+  "spring_regions": [
+    {
+      "id": "SPRING01",
+      "roi": [300, 600, 900, 500],
+      "expected_count": 8,
+      "enabled": true
+    }
+  ]
+}
+```
 
 ## 当前代码结构
 
 ```text
 ProductAlignInspector/
 ├── product_align_inspector/
-│   ├── alignment.py       # 前景分割、产品定位、粗对齐、ECC 精配准
+│   ├── alignment.py       # SIFT/前景定位、粗配准、ECC 精配准
 │   ├── io_utils.py        # Windows 中文路径安全读写
-│   └── roi.py             # 固定 ROI 裁切/配置
+│   └── roi.py             # ROI 配置加载与裁切
 ├── tools/
 │   ├── create_reference.py
 │   ├── align_image.py
-│   └── align_folder.py
+│   ├── align_folder.py
+│   └── annotate_rois.py   # 鼠标 ROI 标注
 ├── configs/
 │   └── product.example.json
 ├── pyproject.toml
@@ -130,11 +181,13 @@ ProductAlignInspector/
 
 ## 后续计划
 
-- Phase 1：产品自动定位 + ECC 配准 ✅（当前第一版）
-- Phase 2：ROI 标注工具（螺丝槽位、空孔、弹簧区域）
-- Phase 3：螺丝 ROI 分类：`screw / empty`
-- Phase 4：弹簧数量 / 缺失检测
-- Phase 5：模型导出 ONNX / 产品特征导出 BIN
-- Phase 6：C# .NET 8 + OpenCvSharp + ONNX Runtime 接入 WinForms
+- Phase 1：产品自动定位 + 配准 ✅
+- Phase 2：ROI 标注工具 ✅
+- Phase 3：从正常/模拟缺陷图片自动生成 `screw / empty` ROI 数据集
+- Phase 4：训练小型螺丝 ROI 分类模型并导出 ONNX
+- Phase 5：弹簧数量 / 缺失检测
+- Phase 6：完整 Python inspection pipeline + PASS/NG
+- Phase 7：ONNX / BIN 交付格式
+- Phase 8：C# .NET 8 + OpenCvSharp + ONNX Runtime 接入 WinForms
 
-部署原则：**Python 用于开发、训练和模型导出；工业电脑端不依赖 Python，也不把 Python 打包成 exe。**
+部署原则：**Python 用于开发、训练、验证和模型导出；工业电脑端不依赖 Python，也不把 Python 打包成 exe。**
