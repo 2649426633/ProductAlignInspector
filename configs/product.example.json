@@ -1,0 +1,31 @@
+{
+  "product": "phone",
+  "coordinate_system": {
+    "reference_image": "artifacts/reference/reference_aligned.png",
+    "note": "All ROI coordinates are defined after product alignment. Replace example values after Phase 2 ROI annotation."
+  },
+  "screw_slots": [
+    {
+      "id": "S01",
+      "roi": [100, 100, 160, 160],
+      "expected": "screw"
+    },
+    {
+      "id": "S02",
+      "roi": [300, 100, 160, 160],
+      "expected": "screw"
+    },
+    {
+      "id": "S03",
+      "roi": [500, 100, 160, 160],
+      "expected": "empty"
+    }
+  ],
+  "spring_regions": [
+    {
+      "id": "SPRING_MAIN",
+      "roi": [100, 400, 600, 400],
+      "expected_count": 0
+    }
+  ]
+}
