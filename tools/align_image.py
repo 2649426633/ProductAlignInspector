@@ -38,11 +38,19 @@ def main() -> None:
     write_json(out / "alignment.json", result.to_dict())
 
     print(f"Aligned image: {out / 'aligned.png'}")
-    print(f"Detected angle: {result.location.angle_deg:.3f} deg")
+    print(f"Method: {result.method}")
+    print(f"Estimated product angle: {result.location.angle_deg:.3f} deg")
+    if result.feature_matches > 0:
+        print(
+            f"Feature matches: {result.feature_matches}, "
+            f"inliers: {result.feature_inliers} "
+            f"({result.feature_inlier_ratio:.1%})"
+        )
     if result.ecc_score is None:
-        print("ECC: failed; coarse alignment was saved as fallback")
+        print("ECC: not available")
     else:
         print(f"ECC score: {result.ecc_score:.6f}")
+    print(f"Overlay: {out / 'overlay.png'}")
 
 
 if __name__ == "__main__":
