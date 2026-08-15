@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "product-align-inspector"
+version = "0.1.0"
+description = "Industrial product alignment and assembly inspection pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26,<3.0",
+  "opencv-python>=4.10,<5.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["product_align_inspector*"]
