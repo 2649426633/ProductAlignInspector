@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+# Allow direct execution such as:
+#   python tools\create_reference.py ...
+# without requiring an editable package install first.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from product_align_inspector.alignment import ProductLocatorConfig, build_foreground_mask, coarse_align
 from product_align_inspector.io_utils import read_image, write_image, write_json
