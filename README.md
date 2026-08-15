@@ -43,11 +43,21 @@ Phase 1：产品定位与对齐。
 
 ## 安装
 
+Windows PowerShell / CMD：
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
+pip install -e .
+```
+
+也可以只安装依赖：
+
+```bash
 pip install -r requirements.txt
 ```
+
+但运行 `tools/` 下脚本时推荐使用 `pip install -e .`，这样项目包会以 editable 模式安装。
 
 ## 1. 创建标准参考图
 
@@ -85,13 +95,42 @@ alignment.json    # 定位和 ECC 信息
 overlay.png       # 与参考图叠加，方便肉眼检查
 ```
 
-## 3. ROI 配置
+## 3. 批量对齐数据集
+
+```bash
+python tools/align_folder.py ^
+  --input-dir D:\data\phone ^
+  --reference artifacts\reference\reference_aligned.png ^
+  --output-dir artifacts\phone_aligned
+```
+
+脚本会递归处理子目录，并生成 `alignment_report.csv`。单张失败不会中断整个批处理。
+
+## 4. ROI 配置
 
 `configs/product.example.json` 用来描述标准坐标中的螺丝孔位和弹簧区域。后续 WinForms 只需要加载产品配置，并在对齐图上裁固定 ROI。
 
+## 当前代码结构
+
+```text
+ProductAlignInspector/
+├── product_align_inspector/
+│   ├── alignment.py       # 前景分割、产品定位、粗对齐、ECC 精配准
+│   ├── io_utils.py        # Windows 中文路径安全读写
+│   └── roi.py             # 固定 ROI 裁切/配置
+├── tools/
+│   ├── create_reference.py
+│   ├── align_image.py
+│   └── align_folder.py
+├── configs/
+│   └── product.example.json
+├── pyproject.toml
+└── requirements.txt
+```
+
 ## 后续计划
 
-- Phase 1：产品自动定位 + ECC 配准 ✅（当前）
+- Phase 1：产品自动定位 + ECC 配准 ✅（当前第一版）
 - Phase 2：ROI 标注工具（螺丝槽位、空孔、弹簧区域）
 - Phase 3：螺丝 ROI 分类：`screw / empty`
 - Phase 4：弹簧数量 / 缺失检测
