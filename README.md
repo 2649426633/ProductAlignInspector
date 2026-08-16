@@ -1,50 +1,58 @@
 # ProductAlignInspector
 
-工业装配完整性检测项目。当前目标是：产品在高分辨率图片中的位置可以变化，但产品始终完整出现在画面内；系统先自动对齐到标准坐标，再检查螺丝、空孔、弹簧等固定装配位置。
+工业装配完整性与局部瑕疵检测项目。
 
-目标流程：
+当前主路线已经切换为：**产品矫正 + 固定 ROI + DINOv2 / PatchCore-style GOOD Memory Bank**。
 
 ```text
 高分辨率原图
     ↓
-产品自动定位 / SIFT 配准
-    ↓
-ECC 小范围精配准
+SIFT + ECC 产品配准
     ↓
 标准坐标系
     ↓
 固定 ROI
     ↓
-螺丝 / 空孔 / 弹簧检测
+DINOv2 patch tokens
+    ↓
+每个 ROI 独立 GOOD Memory Bank + coreset
+    ↓
+局部 anomaly map / anomaly score
     ↓
 PASS / NG
 ```
 
+这条路线主要针对：
+
+- GOOD 数据多、真实 NG/瑕疵样本少；
+- 漏螺丝、多螺丝、错装、部件缺失；
+- 螺丝局部异常；
+- 划痕、磕伤、缺口、异物等未预先分类的局部异常。
+
+之前的 `screw / empty` MobileNet 分类代码仍保留作为监督分类基线，但当前不再作为唯一主方案。
+
 ## 当前阶段
 
-- Phase 1：产品自动定位与对齐 ✅
-- Phase 2：ROI 标注 ✅
-- Phase 3：ROI 稳定性验证 + 训练数据自动裁切 ✅ 当前
+- Phase 1：产品自动定位与配准 ✅
+- Phase 2：固定 ROI 标注与稳定性验证 ✅
+- Phase 3：MobileNet `screw / empty` 基线 ✅
+- Phase 4：ROI DINOv2 / PatchCore GOOD-only Memory Bank ✅ 已开始
+- Phase 5：真实 GOOD / NG score separation 验证 ← 当前
+- Phase 6：DINOv2 ONNX + ROI Memory Bank BIN
+- Phase 7：C# .NET 8 + OpenCvSharp + ONNX Runtime
 
-先把所有图片统一到同一个产品坐标系，再在标准参考图上定义固定 ROI。这样后续螺丝和弹簧检测不需要学习产品在整张图里的位置变化，可以显著减少缺陷数据需求。
+## 安装基础依赖
 
-## 安装
-
-Windows PowerShell / CMD：
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
-```
-
-也可以只安装依赖：
-
-```bash
+```bat
+cd /d D:\Brunei
 pip install -r requirements.txt
 ```
 
-`tools/` 下脚本已经支持直接运行，即使没有先执行 `pip install -e .` 也能找到项目包。
+ROI DINO/PatchCore 开发依赖：
+
+```bat
+pip install -r requirements-anomaly.txt
+```
 
 ## 1. 创建标准参考图
 
@@ -52,195 +60,176 @@ pip install -r requirements.txt
 python tools\create_reference.py --input "D:\Brunei\good.bmp" --output "artifacts\reference"
 ```
 
+## 2. 验证产品配准
+
+```bat
+python tools\align_image.py ^
+  --input "D:\Brunei\test.bmp" ^
+  --reference "artifacts\reference\reference_aligned.png" ^
+  --output "artifacts\test_align"
+```
+
+重点检查：
+
+```text
+artifacts/test_align/overlay.png
+```
+
+## 3. 标注固定 ROI
+
+```bat
+python tools\annotate_rois.py ^
+  --image "artifacts\reference\reference_aligned.png" ^
+  --output "configs\brunei.json" ^
+  --product "Brunei"
+```
+
+现有 `screw_slots`、`spring_regions` 都可以直接作为 anomaly ROI 使用。
+
+另外配置支持通用表面区域：
+
+```json
+"anomaly_regions": [
+  {
+    "id": "SURFACE01",
+    "roi": [900, 300, 500, 350],
+    "enabled": true
+  }
+]
+```
+
+## 4. 准备 GOOD-only 数据
+
+训练 Memory Bank 时只需要正常完整原图：
+
+```text
+D:\Brunei\dataset_roi_dino\
+├─ train\
+│  └─ good\
+│     ├─ good_001.bmp
+│     ├─ good_002.bmp
+│     └─ ...
+└─ test\
+   ├─ good\
+   └─ ng\
+```
+
+`train/good` 不需要人工裁 ROI。程序会自己完成配准和 ROI 裁剪。
+
+建议第一轮先准备 10~30 张不同 GOOD 原图。
+
+## 5. 建 S01 / S02 的 DINOv2 PatchCore Memory Bank
+
+如果继续复用旧项目本地 DINOv2：
+
+```text
+D:\wlenai\third_party\dinov2
+D:\wlenai\weights\dinov2_vits14_pretrain.pth
+```
+
+执行：
+
+```bat
+python tools\build_roi_dino_patchcore.py ^
+  --good-dir "D:\Brunei\dataset_roi_dino\train\good" ^
+  --reference "artifacts\reference\reference_aligned.png" ^
+  --config "configs\brunei.json" ^
+  --output "artifacts\roi_dino_patchcore" ^
+  --roi-id S01 ^
+  --roi-id S02 ^
+  --dino-repo "D:\wlenai\third_party\dinov2" ^
+  --dino-weights "D:\wlenai\weights\dinov2_vits14_pretrain.pth" ^
+  --device auto ^
+  --image-size 224 ^
+  --coreset 0.10
+```
+
 输出：
 
 ```text
-artifacts/reference/
-├── reference_aligned.png
-├── reference_mask.png
-└── reference_meta.json
+artifacts/roi_dino_patchcore/
+├─ model.json
+├─ build_report.csv
+└─ banks/
+   ├─ S01.npz
+   └─ S02.npz
 ```
 
-## 2. 对齐单张图片
+程序默认：
+
+```text
+80% GOOD source -> Memory Bank
+20% GOOD source -> threshold calibration
+```
+
+## 6. 测试原始图片
 
 ```bat
-python tools\align_image.py --input "D:\Brunei\test.bmp" --reference "artifacts\reference\reference_aligned.png" --output "artifacts\test_align"
+python tools\inspect_roi_dino_patchcore.py ^
+  --input "D:\Brunei\test.bmp" ^
+  --model-dir "artifacts\roi_dino_patchcore" ^
+  --dino-repo "D:\wlenai\third_party\dinov2" ^
+  --dino-weights "D:\wlenai\weights\dinov2_vits14_pretrain.pth" ^
+  --device auto ^
+  --output "artifacts\roi_dino_test"
 ```
 
-输出：
+输出包括：
 
 ```text
 aligned.png
-coarse.png
-foreground_mask.png
-alignment.json
-overlay.png
+inspection_preview.png
+inspection.json
+crops/
+heatmaps/
 ```
 
-`overlay.png` 用来肉眼检查标准参考图与当前图片是否真正重合。
+`Score` 越高表示越偏离该 ROI 的正常 Memory Bank。
 
-## 3. 批量对齐数据集
-
-```bat
-python tools\align_folder.py --input-dir "D:\Brunei\dataset" --reference "artifacts\reference\reference_aligned.png" --output-dir "artifacts\aligned_dataset"
-```
-
-脚本会递归处理子目录，并生成 `alignment_report.csv`。单张失败不会中断整个批处理。
-
-## 4. ROI 标注
-
-```bat
-python tools\annotate_rois.py --image "artifacts\reference\reference_aligned.png" --output "configs\brunei.json" --product "Brunei"
-```
-
-操作方式：
+## ROI DINO/PatchCore 代码
 
 ```text
-鼠标左键拖动  画一个 ROI
-S             保存为“这里应该有螺丝”
-E             保存为“这里应该为空”
-P             保存为弹簧区域，并在终端输入期望弹簧数量
-C             取消当前未保存 ROI
-U             撤销
-W             保存 JSON + 预览图
-Q / ESC       退出
+product_align_inspector/anomaly/
+├─ dinov2_adapter.py   # 从旧 patchcores 项目迁移并改成 ROI batch patch-token 提取
+├─ coreset.py          # PatchCore-style approximate greedy coreset
+└─ roi_patchcore.py    # 每个固定 ROI 独立 Memory Bank / score / threshold
+
+tools/
+├─ build_roi_dino_patchcore.py
+└─ inspect_roi_dino_patchcore.py
 ```
 
-保存后得到：
+详细说明：`docs/ROI_DINO_PATCHCORE.md`。
+
+## 第一轮验证目标
+
+先只验证 S01/S02，不要一开始同时做所有区域：
 
 ```text
-configs/brunei.json
-configs/brunei_preview.png
+不同 GOOD 图片
+S01 score 低
+S02 score 低
+
+拆掉 S01
+S01 score 明显升高
+
+恢复 S01、拆掉 S02
+S02 score 明显升高
 ```
 
-所有 ROI 坐标都使用 `reference_aligned.png` 的原始像素坐标，不使用缩小后的屏幕坐标。
+只要 GOOD 和异常 score 能形成明显间隔，再扩展到 E01/E02/E03、弹簧和表面瑕疵 ROI。
 
-## 5. 在 test.bmp 上验证 ROI 是否稳定
+## 最终部署原则
 
-在进入训练前，先确认对齐后每个固定 ROI 仍然准确覆盖同一个螺丝孔/空孔/弹簧区域：
+Python 用于训练、验证和导出。
 
-```bat
-python tools\verify_rois.py --input "D:\Brunei\test.bmp" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\verify_test"
-```
-
-重点打开：
+工业 Windows 端目标：
 
 ```text
-artifacts/verify_test/roi_preview.png
+OpenCvSharp              -> 产品配准 / ROI
+Microsoft.ML.OnnxRuntime -> DINOv2 ONNX
+*.bin                     -> ROI Memory Bank
+C# cosine/L2              -> anomaly score
 ```
 
-并检查：
-
-```text
-artifacts/verify_test/crops/screw_slots/
-artifacts/verify_test/crops/spring_regions/
-```
-
-如果 `roi_preview.png` 中所有框都准确落在对应装配位置，说明“对齐 → 固定 ROI”链路成立，可以开始批量生成训练数据。
-
-## 6. 从 GOOD 图片批量生成 ROI 数据集
-
-推荐只把确认正常的 GOOD 图片作为这一阶段输入，不要把未知 test/NG 图片混入训练集。
-
-单张 GOOD 测试：
-
-```bat
-python tools\extract_roi_dataset.py --input "D:\Brunei\good.bmp" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\roi_dataset"
-```
-
-如果以后 GOOD 图片放在目录中：
-
-```bat
-python tools\extract_roi_dataset.py --input-dir "D:\Brunei\good" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\roi_dataset"
-```
-
-输出结构：
-
-```text
-artifacts/roi_dataset/
-├── screw/
-│   ├── screw/
-│   │   ├── image001__S01.png
-│   │   └── ...
-│   └── empty/
-│       ├── image001__E01.png
-│       └── ...
-├── spring/
-│   ├── count_8/
-│   │   └── image001__SPRING01.png
-│   └── ...
-└── manifest.csv
-```
-
-`manifest.csv` 会保存源图、ROI ID、标签、配准方法、SIFT 匹配数、inlier ratio、ECC 分数和失败原因，后续训练前可以先过滤配准质量不好的图片。
-
-## ROI 配置示例
-
-```json
-{
-  "schema_version": 1,
-  "product": "Brunei",
-  "coordinate_system": {
-    "reference_image": ".../reference_aligned.png",
-    "image_width": 3200,
-    "image_height": 1800
-  },
-  "screw_slots": [
-    {
-      "id": "S01",
-      "roi": [1000, 500, 180, 180],
-      "expected": "screw",
-      "enabled": true
-    },
-    {
-      "id": "E01",
-      "roi": [1400, 500, 180, 180],
-      "expected": "empty",
-      "enabled": true
-    }
-  ],
-  "spring_regions": [
-    {
-      "id": "SPRING01",
-      "roi": [300, 600, 900, 500],
-      "expected_count": 8,
-      "enabled": true
-    }
-  ]
-}
-```
-
-## 当前代码结构
-
-```text
-ProductAlignInspector/
-├── product_align_inspector/
-│   ├── alignment.py
-│   ├── io_utils.py
-│   └── roi.py
-├── tools/
-│   ├── create_reference.py
-│   ├── align_image.py
-│   ├── align_folder.py
-│   ├── annotate_rois.py
-│   ├── verify_rois.py
-│   └── extract_roi_dataset.py
-├── configs/
-│   └── product.example.json
-├── pyproject.toml
-└── requirements.txt
-```
-
-## 后续计划
-
-- Phase 1：产品自动定位 + 配准 ✅
-- Phase 2：ROI 标注工具 ✅
-- Phase 3：ROI 稳定性验证 + GOOD ROI 数据集生成 ✅
-- Phase 4：建立缺螺丝/多螺丝等模拟缺陷采集流程，并训练小型 `screw / empty` 模型
-- Phase 5：导出螺丝分类 ONNX
-- Phase 6：弹簧数量 / 缺失检测
-- Phase 7：完整 Python inspection pipeline + PASS/NG
-- Phase 8：ONNX / BIN 交付格式
-- Phase 9：C# .NET 8 + OpenCvSharp + ONNX Runtime 接入 WinForms
-
-部署原则：**Python 用于开发、训练、验证和模型导出；工业电脑端不依赖 Python，也不把 Python 打包成 exe。**
+工业电脑不依赖 Python，也不把 Python 打包成 exe。
