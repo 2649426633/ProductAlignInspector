@@ -9,3 +9,8 @@ artifacts/
 outputs/
 *.onnx
 *.bin
+
+# Local/offline model assets. Keep large third-party code/weights out of this repo.
+third_party/dinov2/
+weights/*.pth
+weights/*.pt
