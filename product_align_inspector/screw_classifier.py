@@ -9,13 +9,15 @@ from torch import nn
 from torchvision import models, transforms
 from torchvision.models import MobileNet_V3_Small_Weights
 
+from product_align_inspector.deploy_preprocess import DeploymentTensorTransform
+
 DEFAULT_CLASSES = ("empty", "screw")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class PadToSquare:
-    """Pad a PIL image to a square without stretching the ROI geometry."""
+    """Pad a PIL image to a square before training-only augmentation."""
 
     def __init__(self, fill: int | tuple[int, int, int] = 255) -> None:
         self.fill = fill
@@ -31,11 +33,18 @@ class PadToSquare:
 
 
 def build_transforms(input_size: int = 224, train: bool = False) -> transforms.Compose:
-    ops: list[object] = [PadToSquare(fill=255)]
+    """Build training/validation transforms.
+
+    Validation intentionally uses the exact OpenCV deployment preprocessing path.
+    Training may add augmentation first, but its final resize/normalization step is
+    also the same deployment path. This avoids PIL-vs-OpenCV validation drift.
+    """
+    ops: list[object] = []
 
     if train:
         ops.extend(
             [
+                PadToSquare(fill=255),
                 transforms.RandomAffine(
                     degrees=7.0,
                     translate=(0.035, 0.035),
@@ -55,12 +64,12 @@ def build_transforms(input_size: int = 224, train: bool = False) -> transforms.C
             ]
         )
 
-    ops.extend(
-        [
-            transforms.Resize((input_size, input_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
+    ops.append(
+        DeploymentTensorTransform(
+            input_size=input_size,
+            mean=IMAGENET_MEAN,
+            std=IMAGENET_STD,
+        )
     )
     return transforms.Compose(ops)
 
@@ -111,6 +120,7 @@ def save_checkpoint(
         "mean": list(IMAGENET_MEAN),
         "std": list(IMAGENET_STD),
         "metrics": dict(metrics),
+        "preprocess_version": "opencv_deploy_v1",
     }
     if extra:
         payload["extra"] = dict(extra)
