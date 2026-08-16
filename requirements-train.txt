@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Training only. Production WinForms does not need these Python packages.
+torch>=2.5
+torchvision>=0.20
+Pillow>=10
+onnx>=1.17
+onnxruntime>=1.20
