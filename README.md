@@ -23,7 +23,8 @@ PASS / NG
 ## 当前阶段
 
 - Phase 1：产品自动定位与对齐 ✅
-- Phase 2：ROI 标注 ✅ 当前进行
+- Phase 2：ROI 标注 ✅
+- Phase 3：ROI 稳定性验证 + 训练数据自动裁切 ✅ 当前
 
 先把所有图片统一到同一个产品坐标系，再在标准参考图上定义固定 ROI。这样后续螺丝和弹簧检测不需要学习产品在整张图里的位置变化，可以显著减少缺陷数据需求。
 
@@ -46,8 +47,6 @@ pip install -r requirements.txt
 `tools/` 下脚本已经支持直接运行，即使没有先执行 `pip install -e .` 也能找到项目包。
 
 ## 1. 创建标准参考图
-
-例如：
 
 ```bat
 python tools\create_reference.py --input "D:\Brunei\good.bmp" --output "artifacts\reference"
@@ -90,8 +89,6 @@ python tools\align_folder.py --input-dir "D:\Brunei\dataset" --reference "artifa
 
 ## 4. ROI 标注
 
-打开标准参考图：
-
 ```bat
 python tools\annotate_rois.py --image "artifacts\reference\reference_aligned.png" --output "configs\brunei.json" --product "Brunei"
 ```
@@ -109,12 +106,6 @@ W             保存 JSON + 预览图
 Q / ESC       退出
 ```
 
-例如一个螺丝位：先用鼠标框住螺丝及周围少量背景，然后按 `S`。
-
-如果某个孔标准状态应该没有螺丝：框住该孔后按 `E`。
-
-弹簧建议先框“整个需要计数的弹簧区域”，然后按 `P`，终端会要求输入标准弹簧数量。
-
 保存后得到：
 
 ```text
@@ -123,6 +114,65 @@ configs/brunei_preview.png
 ```
 
 所有 ROI 坐标都使用 `reference_aligned.png` 的原始像素坐标，不使用缩小后的屏幕坐标。
+
+## 5. 在 test.bmp 上验证 ROI 是否稳定
+
+在进入训练前，先确认对齐后每个固定 ROI 仍然准确覆盖同一个螺丝孔/空孔/弹簧区域：
+
+```bat
+python tools\verify_rois.py --input "D:\Brunei\test.bmp" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\verify_test"
+```
+
+重点打开：
+
+```text
+artifacts/verify_test/roi_preview.png
+```
+
+并检查：
+
+```text
+artifacts/verify_test/crops/screw_slots/
+artifacts/verify_test/crops/spring_regions/
+```
+
+如果 `roi_preview.png` 中所有框都准确落在对应装配位置，说明“对齐 → 固定 ROI”链路成立，可以开始批量生成训练数据。
+
+## 6. 从 GOOD 图片批量生成 ROI 数据集
+
+推荐只把确认正常的 GOOD 图片作为这一阶段输入，不要把未知 test/NG 图片混入训练集。
+
+单张 GOOD 测试：
+
+```bat
+python tools\extract_roi_dataset.py --input "D:\Brunei\good.bmp" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\roi_dataset"
+```
+
+如果以后 GOOD 图片放在目录中：
+
+```bat
+python tools\extract_roi_dataset.py --input-dir "D:\Brunei\good" --reference "artifacts\reference\reference_aligned.png" --config "configs\brunei.json" --output "artifacts\roi_dataset"
+```
+
+输出结构：
+
+```text
+artifacts/roi_dataset/
+├── screw/
+│   ├── screw/
+│   │   ├── image001__S01.png
+│   │   └── ...
+│   └── empty/
+│       ├── image001__E01.png
+│       └── ...
+├── spring/
+│   ├── count_8/
+│   │   └── image001__SPRING01.png
+│   └── ...
+└── manifest.csv
+```
+
+`manifest.csv` 会保存源图、ROI ID、标签、配准方法、SIFT 匹配数、inlier ratio、ECC 分数和失败原因，后续训练前可以先过滤配准质量不好的图片。
 
 ## ROI 配置示例
 
@@ -165,14 +215,16 @@ configs/brunei_preview.png
 ```text
 ProductAlignInspector/
 ├── product_align_inspector/
-│   ├── alignment.py       # SIFT/前景定位、粗配准、ECC 精配准
-│   ├── io_utils.py        # Windows 中文路径安全读写
-│   └── roi.py             # ROI 配置加载与裁切
+│   ├── alignment.py
+│   ├── io_utils.py
+│   └── roi.py
 ├── tools/
 │   ├── create_reference.py
 │   ├── align_image.py
 │   ├── align_folder.py
-│   └── annotate_rois.py   # 鼠标 ROI 标注
+│   ├── annotate_rois.py
+│   ├── verify_rois.py
+│   └── extract_roi_dataset.py
 ├── configs/
 │   └── product.example.json
 ├── pyproject.toml
@@ -183,11 +235,12 @@ ProductAlignInspector/
 
 - Phase 1：产品自动定位 + 配准 ✅
 - Phase 2：ROI 标注工具 ✅
-- Phase 3：从正常/模拟缺陷图片自动生成 `screw / empty` ROI 数据集
-- Phase 4：训练小型螺丝 ROI 分类模型并导出 ONNX
-- Phase 5：弹簧数量 / 缺失检测
-- Phase 6：完整 Python inspection pipeline + PASS/NG
-- Phase 7：ONNX / BIN 交付格式
-- Phase 8：C# .NET 8 + OpenCvSharp + ONNX Runtime 接入 WinForms
+- Phase 3：ROI 稳定性验证 + GOOD ROI 数据集生成 ✅
+- Phase 4：建立缺螺丝/多螺丝等模拟缺陷采集流程，并训练小型 `screw / empty` 模型
+- Phase 5：导出螺丝分类 ONNX
+- Phase 6：弹簧数量 / 缺失检测
+- Phase 7：完整 Python inspection pipeline + PASS/NG
+- Phase 8：ONNX / BIN 交付格式
+- Phase 9：C# .NET 8 + OpenCvSharp + ONNX Runtime 接入 WinForms
 
 部署原则：**Python 用于开发、训练、验证和模型导出；工业电脑端不依赖 Python，也不把 Python 打包成 exe。**
