@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# ROI DINOv2 / PatchCore development only.
+# Install the torch/torchvision build that matches your CUDA environment if needed.
+torch>=2.5
+torchvision>=0.20
+Pillow>=10
+tqdm>=4.66
