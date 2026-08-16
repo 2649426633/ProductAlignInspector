@@ -28,5 +28,13 @@
       "expected_count": 0,
       "enabled": true
     }
+  ],
+  "anomaly_regions": [
+    {
+      "id": "SURFACE01",
+      "roi": [900, 300, 500, 350],
+      "enabled": true,
+      "note": "Optional generic surface ROI for GOOD-only DINOv2/PatchCore anomaly detection."
+    }
   ]
 }
