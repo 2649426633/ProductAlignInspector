@@ -50,17 +50,28 @@ def main() -> None:
             rows.append({
                 "file": str(rel),
                 "status": "ok",
+                "method": result.method,
                 "angle_deg": result.location.angle_deg,
+                "fallback_rotation_deg": ""
+                if result.fallback_rotation_deg is None
+                else result.fallback_rotation_deg,
+                "feature_inlier_ratio": result.feature_inlier_ratio,
                 "ecc_score": "" if result.ecc_score is None else result.ecc_score,
                 "error": "",
             })
             ok_count += 1
-            status = "OK"
+            status = (
+                f"OK ({result.method}, ecc="
+                f"{'n/a' if result.ecc_score is None else f'{result.ecc_score:.3f}'})"
+            )
         except Exception as exc:  # batch processing should continue and report failures
             rows.append({
                 "file": str(rel),
                 "status": "failed",
+                "method": "",
                 "angle_deg": "",
+                "fallback_rotation_deg": "",
+                "feature_inlier_ratio": "",
                 "ecc_score": "",
                 "error": str(exc),
             })
@@ -69,8 +80,18 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "alignment_report.csv"
+    fieldnames = [
+        "file",
+        "status",
+        "method",
+        "angle_deg",
+        "fallback_rotation_deg",
+        "feature_inlier_ratio",
+        "ecc_score",
+        "error",
+    ]
     with report_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["file", "status", "angle_deg", "ecc_score", "error"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
