@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 import cv2
@@ -33,7 +33,7 @@ class ProductLocatorConfig:
     feature_max_scale: float = 1.30
 
     # ECC is used only as a small refinement after feature alignment.
-    # If its score is weak, keep the feature result instead of damaging it.
+    # If its score is weak, keep the strict feature result instead of damaging it.
     ecc_accept_score: float = 0.75
 
 
@@ -420,6 +420,60 @@ def _ecc_refine(
         return moving.copy(), None, None
 
 
+def _feature_result(
+    image: np.ndarray,
+    reference: np.ndarray,
+    cfg: ProductLocatorConfig,
+    method_prefix: str,
+    ecc_accept: float,
+    ecc_iterations: int,
+    ecc_epsilon: float,
+    motion: int,
+    require_ecc: bool,
+) -> AlignmentResult | None:
+    """Run one SIFT preset and optionally require ECC to independently confirm it."""
+    try:
+        feature_aligned, location, feature_matrix, matches, inliers, inlier_ratio = _feature_align(
+            image, reference, cfg
+        )
+    except (RuntimeError, cv2.error):
+        return None
+
+    refined, ecc_score, ecc_matrix = _ecc_refine(
+        reference,
+        feature_aligned,
+        ecc_iterations,
+        ecc_epsilon,
+        motion,
+    )
+
+    ecc_ok = ecc_score is not None and ecc_score >= ecc_accept
+    if require_ecc and not ecc_ok:
+        return None
+
+    if ecc_ok:
+        aligned = refined
+        method = f"{method_prefix}+ecc"
+    else:
+        aligned = feature_aligned
+        method = method_prefix
+        ecc_matrix = None
+
+    return AlignmentResult(
+        aligned=aligned,
+        coarse=feature_aligned,
+        foreground_mask=location.mask,
+        location=location,
+        ecc_score=ecc_score,
+        ecc_matrix=ecc_matrix,
+        method=method,
+        feature_matches=matches,
+        feature_inliers=inliers,
+        feature_inlier_ratio=inlier_ratio,
+        feature_matrix=feature_matrix,
+    )
+
+
 def align_to_reference(
     image: np.ndarray,
     reference: np.ndarray,
@@ -430,55 +484,95 @@ def align_to_reference(
 ) -> AlignmentResult:
     """Align an input image to the canonical product reference.
 
-    Primary path:
-        full image -> SIFT matches -> RANSAC partial affine -> optional ECC refine
+    Runtime order:
+      1. strict SIFT/RANSAC using the configured production limits;
+      2. staged detail/relaxed/ultra SIFT recovery, accepted only when ECC
+         independently confirms the whole-image alignment;
+      3. foreground/PCA fallback as the final legacy fallback.
 
-    Fallback path:
-        foreground locate -> guarded PCA coarse alignment -> ECC
-
-    The primary path intentionally does NOT use the foreground PCA angle, because
-    dark vignetting/background segmentation can produce a catastrophically wrong
-    orientation even when the product itself is nearly horizontal.
+    Strict SIFT remains the fast path, so normal production images do not pay
+    the cost of the recovery presets. The recovery presets intentionally use
+    stronger ECC gates (0.80 / 0.85) because their feature inlier-ratio limits
+    are weaker than the normal 0.25 production threshold.
     """
     cfg = cfg or ProductLocatorConfig()
     target_size = (reference.shape[1], reference.shape[0])
 
-    try:
-        feature_aligned, location, feature_matrix, matches, inliers, inlier_ratio = _feature_align(
-            image, reference, cfg
-        )
+    strict = _feature_result(
+        image,
+        reference,
+        cfg,
+        method_prefix="sift_affine",
+        ecc_accept=cfg.ecc_accept_score,
+        ecc_iterations=ecc_iterations,
+        ecc_epsilon=ecc_epsilon,
+        motion=motion,
+        require_ecc=False,
+    )
+    if strict is not None:
+        return strict
 
-        refined, ecc_score, ecc_matrix = _ecc_refine(
+    recovery_presets = [
+        (
+            "recovery_detail",
+            replace(
+                cfg,
+                feature_max_dim=2600,
+                feature_nfeatures=8000,
+                feature_ratio_test=0.76,
+                feature_min_matches=10,
+                feature_min_inliers=8,
+                feature_min_inlier_ratio=0.20,
+                feature_ransac_threshold_px=6.0,
+            ),
+            0.80,
+        ),
+        (
+            "recovery_relaxed",
+            replace(
+                cfg,
+                feature_max_dim=3200,
+                feature_nfeatures=12000,
+                feature_ratio_test=0.80,
+                feature_min_matches=8,
+                feature_min_inliers=6,
+                feature_min_inlier_ratio=0.15,
+                feature_ransac_threshold_px=8.0,
+            ),
+            0.80,
+        ),
+        (
+            "recovery_ultra",
+            replace(
+                cfg,
+                feature_max_dim=3600,
+                feature_nfeatures=16000,
+                feature_ratio_test=0.82,
+                feature_min_matches=8,
+                feature_min_inliers=6,
+                feature_min_inlier_ratio=0.12,
+                feature_ransac_threshold_px=10.0,
+            ),
+            0.85,
+        ),
+    ]
+
+    # Recovery ECC gets a few more iterations than the strict fast path.
+    recovery_iterations = max(300, ecc_iterations)
+    for name, recovery_cfg, ecc_accept in recovery_presets:
+        recovered = _feature_result(
+            image,
             reference,
-            feature_aligned,
-            ecc_iterations,
-            ecc_epsilon,
-            motion,
+            recovery_cfg,
+            method_prefix=name,
+            ecc_accept=ecc_accept,
+            ecc_iterations=recovery_iterations,
+            ecc_epsilon=ecc_epsilon,
+            motion=motion,
+            require_ecc=True,
         )
-
-        if ecc_score is not None and ecc_score >= cfg.ecc_accept_score:
-            aligned = refined
-            method = "sift_affine+ecc"
-        else:
-            aligned = feature_aligned
-            method = "sift_affine"
-            ecc_matrix = None
-
-        return AlignmentResult(
-            aligned=aligned,
-            coarse=feature_aligned,
-            foreground_mask=location.mask,
-            location=location,
-            ecc_score=ecc_score,
-            ecc_matrix=ecc_matrix,
-            method=method,
-            feature_matches=matches,
-            feature_inliers=inliers,
-            feature_inlier_ratio=inlier_ratio,
-            feature_matrix=feature_matrix,
-        )
-    except (RuntimeError, cv2.error):
-        pass
+        if recovered is not None:
+            return recovered
 
     coarse, location, original_mask = coarse_align(image, cfg, target_size=target_size)
     refined, ecc_score, ecc_matrix = _ecc_refine(
