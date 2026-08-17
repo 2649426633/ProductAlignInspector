@@ -21,7 +21,13 @@ from product_align_inspector.alignment import (
 from product_align_inspector.io_utils import read_image, write_image
 
 
-def try_preset(image, reference, name: str, cfg: ProductLocatorConfig) -> dict[str, object]:
+def try_preset(
+    image,
+    reference,
+    name: str,
+    cfg: ProductLocatorConfig,
+    ecc_accept: float,
+) -> dict[str, object]:
     row: dict[str, object] = {
         "preset": name,
         "ok": False,
@@ -29,6 +35,7 @@ def try_preset(image, reference, name: str, cfg: ProductLocatorConfig) -> dict[s
         "inliers": 0,
         "inlier_ratio": 0.0,
         "ecc": None,
+        "ecc_accept": float(ecc_accept),
         "accepted": False,
         "error": "",
     }
@@ -37,13 +44,13 @@ def try_preset(image, reference, name: str, cfg: ProductLocatorConfig) -> dict[s
         refined, ecc, ecc_matrix = _ecc_refine(
             reference,
             aligned,
-            iterations=250,
+            iterations=300,
             epsilon=1e-6,
             motion=cv2.MOTION_AFFINE,
         )
-        # Relaxed presets are only considered safe when ECC independently confirms
-        # the feature alignment. This prevents false recovery by weak SIFT matches.
-        accepted = ecc is not None and ecc >= 0.80
+        # Weak/relaxed SIFT is never trusted alone. ECC must independently
+        # confirm the whole aligned image before the recovery is accepted.
+        accepted = ecc is not None and ecc >= ecc_accept
         final = refined if accepted else aligned
         row.update(
             {
@@ -64,7 +71,7 @@ def try_preset(image, reference, name: str, cfg: ProductLocatorConfig) -> dict[s
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Try strict/detail/relaxed SIFT recovery on alignment failures.")
+    p = argparse.ArgumentParser(description="Try staged SIFT/ECC recovery on alignment failures.")
     p.add_argument("--reference", required=True)
     p.add_argument("--input", action="append", required=True, help="May be supplied multiple times")
     p.add_argument("--output", default="artifacts/alignment_recovery")
@@ -76,7 +83,7 @@ def main() -> None:
 
     base = ProductLocatorConfig()
     presets = [
-        ("strict", base),
+        ("strict", base, 0.80),
         (
             "detail",
             replace(
@@ -89,6 +96,7 @@ def main() -> None:
                 feature_min_inlier_ratio=0.20,
                 feature_ransac_threshold_px=6.0,
             ),
+            0.80,
         ),
         (
             "relaxed",
@@ -102,30 +110,50 @@ def main() -> None:
                 feature_min_inlier_ratio=0.15,
                 feature_ransac_threshold_px=8.0,
             ),
+            0.80,
+        ),
+        (
+            "ultra",
+            replace(
+                base,
+                feature_max_dim=3600,
+                feature_nfeatures=16000,
+                feature_ratio_test=0.82,
+                feature_min_matches=8,
+                feature_min_inliers=6,
+                feature_min_inlier_ratio=0.12,
+                feature_ransac_threshold_px=10.0,
+            ),
+            0.85,
         ),
     ]
 
     summary: list[dict[str, object]] = []
     print("=== Alignment Recovery Diagnostic ===", flush=True)
-    print("Acceptance rule for recovery presets: ECC >= 0.80", flush=True)
+    print("Acceptance: strict/detail/relaxed ECC >= 0.80; ultra ECC >= 0.85", flush=True)
 
     for input_text in args.input:
         path = Path(input_text)
         image = read_image(path)
         print(f"\nInput: {path}", flush=True)
-        print(f"{'Preset':<10} {'Matches':>8} {'Inliers':>8} {'Ratio':>9} {'ECC':>9} {'Accepted':>10}", flush=True)
-        print("-" * 60, flush=True)
+        print(
+            f"{'Preset':<10} {'Matches':>8} {'Inliers':>8} {'Ratio':>9} "
+            f"{'ECC':>9} {'Need':>7} {'Accepted':>10}",
+            flush=True,
+        )
+        print("-" * 70, flush=True)
 
         image_rows: list[dict[str, object]] = []
         best: dict[str, object] | None = None
-        for name, cfg in presets:
-            row = try_preset(image, reference, name, cfg)
+        for name, cfg, ecc_accept in presets:
+            row = try_preset(image, reference, name, cfg, ecc_accept)
             image_rows.append(row)
             if row["ok"]:
                 ecc_text = "-" if row["ecc"] is None else f"{float(row['ecc']):.4f}"
                 print(
                     f"{name:<10} {int(row['matches']):>8} {int(row['inliers']):>8} "
-                    f"{float(row['inlier_ratio']):>8.1%} {ecc_text:>9} {str(row['accepted']):>10}",
+                    f"{float(row['inlier_ratio']):>8.1%} {ecc_text:>9} "
+                    f"{float(row['ecc_accept']):>7.2f} {str(row['accepted']):>10}",
                     flush=True,
                 )
                 if row["accepted"] and (best is None or float(row["ecc"]) > float(best["ecc"])):
@@ -146,7 +174,7 @@ def main() -> None:
         else:
             for row in image_rows:
                 row.pop("aligned", None)
-            print("NOT RECOVERED: no preset passed ECC >= 0.80", flush=True)
+            print("NOT RECOVERED: no preset passed its ECC acceptance threshold", flush=True)
 
         for row in image_rows:
             row.pop("aligned", None)
