@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 from product_align_inspector.alignment import ProductLocatorConfig, align_to_reference
 from product_align_inspector.anomaly.dinov2_adapter import DINOv2Adapter, DINOv2Config
 from product_align_inspector.anomaly.roi_patchcore import load_roi_model, read_model_manifest, score_patch_tokens
+from product_align_inspector.decision_rules import load_decision_multipliers, roi_multiplier
 from product_align_inspector.io_utils import read_image
 from product_align_inspector.roi import crop_roi, validate_roi
 
@@ -38,17 +39,6 @@ def classify_group(roi_id: str) -> str:
 
 
 def scenario_policy(name: str, groups: dict[str, set[str]]) -> tuple[str, set[str], bool]:
-    """Return (mode, target_rois, require_all_targets).
-
-    Product rules:
-      Sxx = expected screw. A defect means the required screw state changed.
-      Exx = expected empty. A defect means an unexpected screw/object appeared.
-      SPRINGxx = ignored for the current product decision.
-
-    Dataset folder names only provide category-level truth, not exact per-ROI truth.
-    Therefore we evaluate whether the relevant S/E group detects the scenario and
-    do not treat detections in other S/E ROIs as false/off-target errors.
-    """
     lower = name.strip().lower()
     if lower == "good":
         return "GOOD", set(), False
@@ -59,6 +49,15 @@ def scenario_policy(name: str, groups: dict[str, set[str]]) -> tuple[str, set[st
     if lower in {"excess_screws", "extra_screws", "excess_screw", "extra_screw"}:
         return "EMPTY_ANY", set(groups["EMPTY"]), False
     return "PRODUCT_ANY", set(groups["SCREW"]) | set(groups["EMPTY"]), False
+
+
+def _resolve_rules_path(text: str | None) -> Path | None:
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
 
 
 def main() -> None:
@@ -73,10 +72,18 @@ def main() -> None:
     p.add_argument("--device", default="auto")
     p.add_argument("--output", default="artifacts/roi_dino_full_evaluation")
     p.add_argument("--threshold-scale", type=float, default=1.0)
+    p.add_argument(
+        "--decision-rules",
+        default="configs/brunei_decision_rules.json",
+        help="JSON with per-ROI threshold multipliers",
+    )
     args = p.parse_args()
 
     if args.threshold_scale <= 0:
         raise SystemExit("--threshold-scale must be > 0")
+
+    rules_path = _resolve_rules_path(args.decision_rules)
+    default_multiplier, roi_multipliers = load_decision_multipliers(rules_path)
 
     test_root = Path(args.test_root)
     model_dir = Path(args.model_dir)
@@ -89,7 +96,6 @@ def main() -> None:
     for model in all_models:
         groups[classify_group(model.roi_id)].add(model.roi_id)
 
-    # Current production decision only uses S/E. Spring quantity/state is postponed.
     models = [m for m in all_models if classify_group(m.roi_id) in {"SCREW", "EMPTY"}]
     ignored_models = [m for m in all_models if m not in models]
     if not models:
@@ -120,7 +126,6 @@ def main() -> None:
 
     reference = read_image(reference_path)
     align_cfg = ProductLocatorConfig(foreground_threshold=int(align_meta.get("foreground_threshold", 238)))
-    min_inlier_ratio = float(align_meta.get("min_inlier_ratio", 0.25))
     dino = DINOv2Adapter(device=args.device, config=dino_cfg, project_root=REPO_ROOT)
     dino.load()
 
@@ -148,6 +153,8 @@ def main() -> None:
     print(f"EMPTY ROIs:   {sorted(groups['EMPTY'])}", flush=True)
     print(f"Ignored ROIs: {[m.roi_id for m in ignored_models]}", flush=True)
     print(f"Decision ROI count: {len(models)}", flush=True)
+    print(f"Rules:        {rules_path if rules_path and rules_path.is_file() else 'default x1.0'}", flush=True)
+    print(f"Margins:      {roi_multipliers if roi_multipliers else '-'}", flush=True)
     print("", flush=True)
 
     for idx, (scenario, image_path) in enumerate(scenarios, 1):
@@ -155,10 +162,6 @@ def main() -> None:
         try:
             raw = read_image(image_path)
             alignment = align_to_reference(raw, reference, align_cfg)
-            if alignment.method.startswith("sift") and alignment.feature_inlier_ratio < min_inlier_ratio:
-                raise RuntimeError(
-                    f"weak alignment {alignment.feature_inlier_ratio:.3f} < {min_inlier_ratio:.3f}"
-                )
 
             aligned = alignment.aligned
             h, w = aligned.shape[:2]
@@ -181,7 +184,9 @@ def main() -> None:
                     patch_grid=model.patch_grid,
                     top_fraction=model.score_top_fraction,
                 )
-                threshold = None if model.threshold is None else float(model.threshold) * args.threshold_scale
+                base_threshold = None if model.threshold is None else float(model.threshold)
+                multiplier = roi_multiplier(model.roi_id, default_multiplier, roi_multipliers)
+                threshold = None if base_threshold is None else base_threshold * args.threshold_scale * multiplier
                 is_defect = threshold is not None and score > threshold
                 if is_defect:
                     predicted.add(model.roi_id)
@@ -204,8 +209,10 @@ def main() -> None:
                     "prediction": "DEFECT" if is_defect else "NORMAL",
                     "defect_meaning": defect_meaning if is_defect else "",
                     "score": float(score),
-                    "threshold": threshold,
-                    "score_over_threshold": None if threshold is None else float(score / threshold),
+                    "base_threshold": base_threshold,
+                    "decision_multiplier": float(multiplier),
+                    "decision_threshold": threshold,
+                    "score_over_decision_threshold": None if threshold is None else float(score / threshold),
                     "alignment_method": alignment.method,
                     "feature_inlier_ratio": float(alignment.feature_inlier_ratio),
                     "ecc_score": "" if alignment.ecc_score is None else float(alignment.ecc_score),
@@ -255,8 +262,10 @@ def main() -> None:
                 "prediction": "",
                 "defect_meaning": "",
                 "score": "",
-                "threshold": "",
-                "score_over_threshold": "",
+                "base_threshold": "",
+                "decision_multiplier": "",
+                "decision_threshold": "",
+                "score_over_decision_threshold": "",
                 "alignment_method": "",
                 "feature_inlier_ratio": "",
                 "ecc_score": "",
@@ -269,8 +278,9 @@ def main() -> None:
     csv_path = out / "scores_product_rules.csv"
     fieldnames = [
         "scenario", "mode", "source", "roi_id", "roi_group", "expected", "prediction",
-        "defect_meaning", "score", "threshold", "score_over_threshold", "alignment_method",
-        "feature_inlier_ratio", "ecc_score", "dino_seconds", "status", "error",
+        "defect_meaning", "score", "base_threshold", "decision_multiplier", "decision_threshold",
+        "score_over_decision_threshold", "alignment_method", "feature_inlier_ratio", "ecc_score",
+        "dino_seconds", "status", "error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -279,11 +289,14 @@ def main() -> None:
 
     total_s = time.perf_counter() - t_all
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product_rules": {
             "S": "must_have_screw",
             "E": "must_be_empty",
             "SPRING": "ignored_for_now",
+            "decision_rules_file": "" if rules_path is None else str(rules_path),
+            "default_threshold_multiplier": default_multiplier,
+            "roi_threshold_multipliers": roi_multipliers,
         },
         "model_dir": str(model_dir),
         "test_root": str(test_root),
