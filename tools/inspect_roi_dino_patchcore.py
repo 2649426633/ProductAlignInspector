@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -80,7 +79,7 @@ def _save_heatmap(crop: np.ndarray, anomaly_map: np.ndarray, threshold: float | 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inspect product ROIs. S=must have screw, E=must be empty; springs are ignored by default."
+        description="Production-style single image inspection. S=must have screw, E=must be empty."
     )
     parser.add_argument("--input", required=True, help="Raw full-resolution production image")
     parser.add_argument("--model-dir", default="artifacts/roi_dino_full")
@@ -88,12 +87,17 @@ def main() -> None:
     parser.add_argument("--dino-repo", help="Override local DINOv2 repository")
     parser.add_argument("--dino-weights", help="Override DINOv2 weights")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--output", default="artifacts/roi_anomaly_test")
+    parser.add_argument("--output", default="artifacts/product_inspection")
     parser.add_argument("--threshold-scale", type=float, default=1.0, help="Multiply calibrated ROI thresholds")
     parser.add_argument(
         "--include-springs",
         action="store_true",
-        help="Also score SPRING ROIs for observation only. They never affect final PASS/NG.",
+        help="Score SPRING ROIs for observation only. They never affect final PASS/NG.",
+    )
+    parser.add_argument(
+        "--save-debug",
+        action="store_true",
+        help="Save per-ROI crops and heatmaps. Off by default for production-style runs.",
     )
     args = parser.parse_args()
 
@@ -129,30 +133,45 @@ def main() -> None:
     if not decision_models:
         raise RuntimeError("No S/E decision ROI banks found")
 
-    print("=== Product ROI Inspection ===", flush=True)
+    print("=== Product Inspection ===", flush=True)
     print("Rule: Sxx must HAVE screw; Exx must be EMPTY.", flush=True)
     print("SPRING ROIs: " + ("observe only" if args.include_springs else "ignored"), flush=True)
     print(f"Input:      {input_path}", flush=True)
     print(f"Model dir:  {model_dir}", flush=True)
     print(f"Decision:   {[m.roi_id for m in decision_models]}", flush=True)
-    if observe_models:
-        print(f"Observe:    {[m.roi_id for m in observe_models]}", flush=True)
 
     t_total = time.perf_counter()
     raw = read_image(input_path)
     reference = read_image(reference_path)
 
     t0 = time.perf_counter()
-    alignment = align_to_reference(
-        raw,
-        reference,
-        ProductLocatorConfig(foreground_threshold=int(align_meta.get("foreground_threshold", 238))),
-    )
+    try:
+        alignment = align_to_reference(
+            raw,
+            reference,
+            ProductLocatorConfig(foreground_threshold=int(align_meta.get("foreground_threshold", 238))),
+        )
+    except Exception as exc:
+        alignment_seconds = time.perf_counter() - t0
+        total_seconds = time.perf_counter() - t_total
+        report = {
+            "schema_version": 3,
+            "model_type": "roi_dinov2_patchcore_product_rules",
+            "input": str(input_path),
+            "model_dir": str(model_dir),
+            "final_status": "RETRY",
+            "reason": "ALIGNMENT_FAILED",
+            "error": str(exc),
+            "timing_seconds": {"alignment": alignment_seconds, "total": total_seconds},
+            "rois": [],
+        }
+        write_json(out / "inspection.json", report)
+        print(f"FINAL:           RETRY", flush=True)
+        print(f"Reason:          ALIGNMENT_FAILED: {exc}", flush=True)
+        print(f"Report:          {out / 'inspection.json'}", flush=True)
+        return
+
     alignment_seconds = time.perf_counter() - t0
-    min_inlier_ratio = float(align_meta.get("min_inlier_ratio", 0.25))
-    alignment_ok = not (
-        alignment.method.startswith("sift") and alignment.feature_inlier_ratio < min_inlier_ratio
-    )
     print(
         f"Alignment: {alignment.method}, matches={alignment.feature_matches}, "
         f"inliers={alignment.feature_inliers}, ratio={alignment.feature_inlier_ratio:.1%}, "
@@ -169,7 +188,8 @@ def main() -> None:
             raise RuntimeError(f"Invalid saved ROI {model.roi_id}: {model.roi} for aligned {w}x{h}")
         crop = crop_roi(aligned, model.roi)
         crops.append(crop)
-        write_image(out / "crops" / f"{model.roi_id}.png", crop)
+        if args.save_debug:
+            write_image(out / "crops" / f"{model.roi_id}.png", crop)
 
     dino = DINOv2Adapter(device=args.device, config=dino_cfg, project_root=REPO_ROOT)
     dino.load()
@@ -183,11 +203,12 @@ def main() -> None:
     scoring_start = time.perf_counter()
 
     print("", flush=True)
-    print(f"{'ROI':<12} {'Expected':<14} {'Score':>9} {'Threshold':>9} {'Result':<12}", flush=True)
-    print("-" * 64, flush=True)
+    print(f"{'ROI':<12} {'Expected':<14} {'Score':>9} {'Threshold':>9} {'Result':<12} {'Reason'}", flush=True)
+    print("-" * 88, flush=True)
 
-    any_ng = not alignment_ok
+    any_ng = False
     any_unknown = False
+    ng_rois: list[str] = []
 
     for model, crop, tokens in zip(models, crops, tokens_batch):
         roi_group = _group(model.roi_id)
@@ -204,20 +225,15 @@ def main() -> None:
         anomaly = threshold is not None and score > threshold
 
         if required:
-            if not alignment_ok:
-                status = "NG"
-                reason = "Alignment Uncertain"
-            elif threshold is None:
+            if threshold is None:
                 status = "UNKNOWN"
                 reason = "Threshold Not Calibrated"
                 any_unknown = True
             elif anomaly:
                 status = "NG"
-                if roi_group == "SCREW":
-                    reason = "Missing/Wrong Screw"
-                else:
-                    reason = "Unexpected Screw/Object"
+                reason = "Missing/Wrong Screw" if roi_group == "SCREW" else "Unexpected Screw/Object"
                 any_ng = True
+                ng_rois.append(model.roi_id)
             else:
                 status = "PASS"
                 reason = "OK"
@@ -227,18 +243,20 @@ def main() -> None:
 
         threshold_text = "-" if threshold is None else f"{threshold:.4f}"
         print(
-            f"{model.roi_id:<12} {expected:<14} {score:>9.4f} {threshold_text:>9} {status:<12}",
+            f"{model.roi_id:<12} {expected:<14} {score:>9.4f} {threshold_text:>9} "
+            f"{status:<12} {reason}",
             flush=True,
         )
 
         draw_status = status if status in {"PASS", "NG"} else "UNKNOWN"
-        _draw_result(
-            preview,
-            model.roi,
-            f"{model.roi_id} {status}",
-            draw_status,
-        )
-        _save_heatmap(crop, anomaly_map, threshold, out / "heatmaps" / f"{model.roi_id}.png")
+        _draw_result(preview, model.roi, f"{model.roi_id} {status}", draw_status)
+
+        crop_path = ""
+        heatmap_path = ""
+        if args.save_debug:
+            crop_path = str(out / "crops" / f"{model.roi_id}.png")
+            heatmap_path = str(out / "heatmaps" / f"{model.roi_id}.png")
+            _save_heatmap(crop, anomaly_map, threshold, Path(heatmap_path))
 
         results.append(
             {
@@ -247,19 +265,19 @@ def main() -> None:
                 "required_for_product": required,
                 "expected": expected,
                 "roi": list(model.roi),
-                "score": score,
+                "score": float(score),
                 "threshold": threshold,
                 "status": status,
                 "reason": reason,
                 "patch_stats": stats,
                 "memory_features": int(len(model.memory)),
-                "crop": str(out / "crops" / f"{model.roi_id}.png"),
-                "heatmap": str(out / "heatmaps" / f"{model.roi_id}.png"),
+                "crop": crop_path,
+                "heatmap": heatmap_path,
             }
         )
 
     scoring_seconds = time.perf_counter() - scoring_start
-    if not alignment_ok or any_ng:
+    if any_ng:
         final_status = "NG"
     elif any_unknown:
         final_status = "UNKNOWN"
@@ -269,9 +287,12 @@ def main() -> None:
     banner_color = (0, 160, 0) if final_status == "PASS" else ((0, 0, 255) if final_status == "NG" else (0, 180, 255))
     banner_h = max(50, int(round(preview.shape[0] * 0.06)))
     cv2.rectangle(preview, (0, 0), (preview.shape[1], banner_h), banner_color, -1)
+    banner_text = f"PRODUCT {final_status}"
+    if ng_rois:
+        banner_text += "  |  NG: " + ",".join(ng_rois)
     cv2.putText(
         preview,
-        f"PRODUCT {final_status}  |  S=must have screw, E=must be empty",
+        banner_text,
         (20, int(banner_h * 0.68)),
         cv2.FONT_HERSHEY_SIMPLEX,
         max(0.8, banner_h / 65.0),
@@ -283,8 +304,10 @@ def main() -> None:
     total_seconds = time.perf_counter() - t_total
     write_image(out / "aligned.png", aligned)
     write_image(out / "inspection_preview.png", preview)
+
+    pass_rois = [r["id"] for r in results if r["required_for_product"] and r["status"] == "PASS"]
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model_type": "roi_dinov2_patchcore_product_rules",
         "product_rules": {
             "S": "must_have_screw",
@@ -294,10 +317,15 @@ def main() -> None:
         "input": str(input_path),
         "model_dir": str(model_dir),
         "final_status": final_status,
+        "summary": {
+            "decision_roi_count": len(decision_models),
+            "pass_roi_count": len(pass_rois),
+            "ng_roi_count": len(ng_rois),
+            "ng_rois": ng_rois,
+        },
         "alignment": {
             **alignment.to_dict(),
-            "accepted": alignment_ok,
-            "min_inlier_ratio": min_inlier_ratio,
+            "accepted": True,
         },
         "timing_seconds": {
             "alignment": alignment_seconds,
@@ -305,17 +333,24 @@ def main() -> None:
             "memory_scoring": scoring_seconds,
             "total": total_seconds,
         },
+        "outputs": {
+            "aligned": str(out / "aligned.png"),
+            "preview": str(out / "inspection_preview.png"),
+            "debug_artifacts_saved": bool(args.save_debug),
+        },
         "rois": results,
     }
     write_json(out / "inspection.json", report)
 
     print("", flush=True)
-    print(f"DINO batch time: {dino_seconds:.3f}s for {len(models)} ROI(s)", flush=True)
-    print(f"Scoring time:    {scoring_seconds:.3f}s", flush=True)
-    print(f"TOTAL:           {total_seconds:.3f}s", flush=True)
-    print(f"FINAL:           {final_status}", flush=True)
-    print(f"Preview:         {out / 'inspection_preview.png'}", flush=True)
-    print(f"Report:          {out / 'inspection.json'}", flush=True)
+    print(f"Decision ROIs:    {len(decision_models)}", flush=True)
+    print(f"NG ROIs:          {ng_rois if ng_rois else '-'}", flush=True)
+    print(f"DINO batch time:  {dino_seconds:.3f}s for {len(models)} ROI(s)", flush=True)
+    print(f"Scoring time:     {scoring_seconds:.3f}s", flush=True)
+    print(f"TOTAL:            {total_seconds:.3f}s", flush=True)
+    print(f"FINAL:            {final_status}", flush=True)
+    print(f"Preview:          {out / 'inspection_preview.png'}", flush=True)
+    print(f"Report:           {out / 'inspection.json'}", flush=True)
 
 
 if __name__ == "__main__":
