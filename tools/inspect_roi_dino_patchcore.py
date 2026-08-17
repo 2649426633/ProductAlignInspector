@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from product_align_inspector.alignment import ProductLocatorConfig, align_to_reference
 from product_align_inspector.anomaly.dinov2_adapter import DINOv2Adapter, DINOv2Config
 from product_align_inspector.anomaly.roi_patchcore import load_roi_model, read_model_manifest, score_patch_tokens
+from product_align_inspector.decision_rules import load_decision_multipliers, roi_multiplier
 from product_align_inspector.io_utils import read_image, write_image, write_json
 from product_align_inspector.roi import crop_roi, validate_roi
 
@@ -77,6 +78,15 @@ def _save_heatmap(crop: np.ndarray, anomaly_map: np.ndarray, threshold: float | 
     write_image(output, overlay)
 
 
+def _resolve_rules_path(text: str | None) -> Path | None:
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Production-style single image inspection. S=must have screw, E=must be empty."
@@ -88,7 +98,12 @@ def main() -> None:
     parser.add_argument("--dino-weights", help="Override DINOv2 weights")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output", default="artifacts/product_inspection")
-    parser.add_argument("--threshold-scale", type=float, default=1.0, help="Multiply calibrated ROI thresholds")
+    parser.add_argument("--threshold-scale", type=float, default=1.0, help="Global multiplier for calibrated thresholds")
+    parser.add_argument(
+        "--decision-rules",
+        default="configs/brunei_decision_rules.json",
+        help="JSON with per-ROI threshold multipliers",
+    )
     parser.add_argument(
         "--include-springs",
         action="store_true",
@@ -108,6 +123,9 @@ def main() -> None:
     model_dir = Path(args.model_dir)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
+
+    rules_path = _resolve_rules_path(args.decision_rules)
+    default_multiplier, roi_multipliers = load_decision_multipliers(rules_path)
 
     manifest = read_model_manifest(model_dir)
     reference_path = Path(args.reference or manifest["reference_image"])
@@ -139,6 +157,9 @@ def main() -> None:
     print(f"Input:      {input_path}", flush=True)
     print(f"Model dir:  {model_dir}", flush=True)
     print(f"Decision:   {[m.roi_id for m in decision_models]}", flush=True)
+    print(f"Rules:      {rules_path if rules_path and rules_path.is_file() else 'default x1.0'}", flush=True)
+    if roi_multipliers:
+        print(f"Margins:    {roi_multipliers}", flush=True)
 
     t_total = time.perf_counter()
     raw = read_image(input_path)
@@ -155,7 +176,7 @@ def main() -> None:
         alignment_seconds = time.perf_counter() - t0
         total_seconds = time.perf_counter() - t_total
         report = {
-            "schema_version": 3,
+            "schema_version": 4,
             "model_type": "roi_dinov2_patchcore_product_rules",
             "input": str(input_path),
             "model_dir": str(model_dir),
@@ -166,7 +187,7 @@ def main() -> None:
             "rois": [],
         }
         write_json(out / "inspection.json", report)
-        print(f"FINAL:           RETRY", flush=True)
+        print("FINAL:           RETRY", flush=True)
         print(f"Reason:          ALIGNMENT_FAILED: {exc}", flush=True)
         print(f"Report:          {out / 'inspection.json'}", flush=True)
         return
@@ -203,8 +224,11 @@ def main() -> None:
     scoring_start = time.perf_counter()
 
     print("", flush=True)
-    print(f"{'ROI':<12} {'Expected':<14} {'Score':>9} {'Threshold':>9} {'Result':<12} {'Reason'}", flush=True)
-    print("-" * 88, flush=True)
+    print(
+        f"{'ROI':<12} {'Expected':<14} {'Score':>9} {'BaseT':>9} {'Mult':>6} {'DecisionT':>10} {'Result':<10} {'Reason'}",
+        flush=True,
+    )
+    print("-" * 104, flush=True)
 
     any_ng = False
     any_unknown = False
@@ -221,7 +245,9 @@ def main() -> None:
             patch_grid=model.patch_grid,
             top_fraction=model.score_top_fraction,
         )
-        threshold = None if model.threshold is None else float(model.threshold) * args.threshold_scale
+        base_threshold = None if model.threshold is None else float(model.threshold)
+        multiplier = roi_multiplier(model.roi_id, default_multiplier, roi_multipliers)
+        threshold = None if base_threshold is None else base_threshold * args.threshold_scale * multiplier
         anomaly = threshold is not None and score > threshold
 
         if required:
@@ -241,10 +267,11 @@ def main() -> None:
             status = "OBSERVE"
             reason = "Anomaly observed" if anomaly else "Not used for product decision"
 
+        base_text = "-" if base_threshold is None else f"{base_threshold:.4f}"
         threshold_text = "-" if threshold is None else f"{threshold:.4f}"
         print(
-            f"{model.roi_id:<12} {expected:<14} {score:>9.4f} {threshold_text:>9} "
-            f"{status:<12} {reason}",
+            f"{model.roi_id:<12} {expected:<14} {score:>9.4f} {base_text:>9} {multiplier:>6.2f} "
+            f"{threshold_text:>10} {status:<10} {reason}",
             flush=True,
         )
 
@@ -266,7 +293,10 @@ def main() -> None:
                 "expected": expected,
                 "roi": list(model.roi),
                 "score": float(score),
+                "base_threshold": base_threshold,
+                "decision_multiplier": float(multiplier),
                 "threshold": threshold,
+                "score_over_decision_threshold": None if threshold is None else float(score / threshold),
                 "status": status,
                 "reason": reason,
                 "patch_stats": stats,
@@ -307,12 +337,15 @@ def main() -> None:
 
     pass_rois = [r["id"] for r in results if r["required_for_product"] and r["status"] == "PASS"]
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "model_type": "roi_dinov2_patchcore_product_rules",
         "product_rules": {
             "S": "must_have_screw",
             "E": "must_be_empty",
             "SPRING": "ignored_for_product_decision",
+            "decision_rules_file": "" if rules_path is None else str(rules_path),
+            "default_threshold_multiplier": default_multiplier,
+            "roi_threshold_multipliers": roi_multipliers,
         },
         "input": str(input_path),
         "model_dir": str(model_dir),
