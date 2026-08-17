@@ -20,6 +20,8 @@ from product_align_inspector.io_utils import read_image
 from product_align_inspector.roi import crop_roi, validate_roi
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+GENERIC_NG_NAMES = {"missing_screws", "excess_screws"}
+ALL_DEFECT_NAMES = {"all_empty", "all_missing", "all_defect", "all_ng"}
 
 
 def collect_images(root: Path) -> list[Path]:
@@ -28,12 +30,28 @@ def collect_images(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
 
 
-def parse_defect_rois(folder_name: str, known_ids: set[str]) -> set[str]:
-    """Parse e.g. missing_S01, defect_S02, missing_S01+missing_S02.
+def parse_defect_rois(folder_name: str, known_ids: set[str]) -> set[str] | None:
+    """Map an NG scenario folder to exact ROI truth when possible.
 
-    Folder names are case-insensitive for prefixes and ROI IDs are matched
-    case-insensitively back to the exact IDs stored in the model.
+    Supported examples:
+      missing_S01
+      missing_S02
+      missing_S01+missing_S02
+      all_empty                 -> all currently modeled ROI IDs
+      missing_screws            -> generic NG, ROI location unknown
+      excess_screws             -> generic NG, ROI location unknown
+
+    ``None`` means the image is known to be NG at image level, but the folder
+    name does not provide enough information to assign a per-ROI truth label.
+    Such samples are included in image-level generic-NG statistics and are
+    excluded from strict per-ROI false-alarm / miss-rate statistics.
     """
+    lower_name = folder_name.strip().lower()
+    if lower_name in ALL_DEFECT_NAMES:
+        return set(known_ids)
+    if lower_name in GENERIC_NG_NAMES:
+        return None
+
     name_map = {rid.lower(): rid for rid in known_ids}
     defects: set[str] = set()
     for token in folder_name.split("+"):
@@ -50,7 +68,9 @@ def parse_defect_rois(folder_name: str, known_ids: set[str]) -> set[str]:
         if exact is None:
             raise ValueError(
                 f"Cannot map NG scenario '{folder_name}' token '{token}' to ROI ID. "
-                f"Known ROI IDs: {sorted(known_ids)}"
+                f"Known ROI IDs: {sorted(known_ids)}. "
+                "Use an existing generic folder name (missing_screws/excess_screws/all_empty) "
+                "or a localized name such as missing_S01."
             )
         defects.add(exact)
     return defects
@@ -73,7 +93,7 @@ def stats(values: list[float]) -> dict[str, float | int | None]:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Strict ROI-aware evaluation for aligned fixed-ROI DINOv2/PatchCore models."
+        description="ROI-aware evaluation for fixed-ROI DINOv2/PatchCore models."
     )
     p.add_argument("--test-root", required=True)
     p.add_argument("--model-dir", default="artifacts/roi_dino_patchcore")
@@ -100,13 +120,20 @@ def main() -> None:
         raise RuntimeError("No ROI models in model.json")
     known_ids = {m.roi_id for m in models}
 
-    scenarios: list[tuple[str, Path, set[str]]] = []
+    # defect_rois meanings:
+    #   set()      -> exact GOOD truth
+    #   {'S01'}    -> exact localized defect truth
+    #   {'S01','S02'} -> exact all-empty truth for current model
+    #   None       -> generic image-level NG; exact ROI truth unknown
+    scenarios: list[tuple[str, Path, set[str] | None]] = []
     for image in good_images:
         scenarios.append(("GOOD", image, set()))
 
+    scenario_modes: dict[str, str] = {}
     if ng_root.is_dir():
         for scenario_dir in sorted(p for p in ng_root.iterdir() if p.is_dir()):
             defect_rois = parse_defect_rois(scenario_dir.name, known_ids)
+            scenario_modes[scenario_dir.name] = "GENERIC_NG" if defect_rois is None else "EXACT_ROI"
             for image in collect_images(scenario_dir):
                 scenarios.append((scenario_dir.name, image, defect_rois))
 
@@ -139,13 +166,14 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, object]] = []
-    per_roi = {
-        m.roi_id: {"NORMAL": [], "DEFECT": []}
-        for m in models
-    }
-    image_correct = 0
+    per_roi = {m.roi_id: {"NORMAL": [], "DEFECT": []} for m in models}
+
     valid_images = 0
     failed_images = 0
+    exact_labeled_images = 0
+    exact_labeled_correct = 0
+    generic_ng_images = 0
+    generic_ng_detected = 0
     false_alarm_rois = 0
     missed_defect_rois = 0
     normal_roi_total = 0
@@ -153,10 +181,14 @@ def main() -> None:
     total_dino = 0.0
     total_start = time.perf_counter()
 
-    print("=== Strict ROI DINOv2 / PatchCore Evaluation ===", flush=True)
+    print("=== ROI DINOv2 / PatchCore Evaluation ===", flush=True)
     print(f"GOOD images: {len(good_images)}", flush=True)
     print(f"Total images: {len(scenarios)}", flush=True)
     print(f"ROI IDs: {[m.roi_id for m in models]}", flush=True)
+    if scenario_modes:
+        print("Scenario modes:", flush=True)
+        for name, mode in scenario_modes.items():
+            print(f"  {name}: {mode}", flush=True)
     print("", flush=True)
 
     for idx, (scenario, image_path, defect_rois) in enumerate(scenarios, 1):
@@ -182,7 +214,8 @@ def main() -> None:
             total_dino += dino_s
 
             predicted_defects: set[str] = set()
-            detail = []
+            detail: list[str] = []
+
             for model, tokens in zip(models, token_batch):
                 score, _map, patch_stats = score_patch_tokens(
                     tokens,
@@ -192,33 +225,39 @@ def main() -> None:
                 )
                 threshold = None if model.threshold is None else float(model.threshold) * args.threshold_scale
                 pred_defect = threshold is not None and score > threshold
-                truth_defect = model.roi_id in defect_rois
                 if pred_defect:
                     predicted_defects.add(model.roi_id)
 
-                state = "DEFECT" if truth_defect else "NORMAL"
-                per_roi[model.roi_id][state].append(float(score))
-                if truth_defect:
-                    defect_roi_total += 1
-                    if not pred_defect:
-                        missed_defect_rois += 1
+                if defect_rois is None:
+                    truth_state = "UNKNOWN_NG"
+                    roi_correct: bool | str = ""
                 else:
-                    normal_roi_total += 1
-                    if pred_defect:
-                        false_alarm_rois += 1
+                    truth_defect = model.roi_id in defect_rois
+                    truth_state = "DEFECT" if truth_defect else "NORMAL"
+                    per_roi[model.roi_id][truth_state].append(float(score))
+                    if truth_defect:
+                        defect_roi_total += 1
+                        if not pred_defect:
+                            missed_defect_rois += 1
+                    else:
+                        normal_roi_total += 1
+                        if pred_defect:
+                            false_alarm_rois += 1
+                    roi_correct = pred_defect == truth_defect
 
-                roi_correct = pred_defect == truth_defect
                 rows.append({
                     "scenario": scenario,
+                    "scenario_mode": "GENERIC_NG" if defect_rois is None else "EXACT_ROI",
                     "source": str(image_path),
                     "roi_id": model.roi_id,
-                    "truth": state,
+                    "truth": truth_state,
                     "prediction": "DEFECT" if pred_defect else "NORMAL",
                     "correct": roi_correct,
                     "score": float(score),
                     "threshold": threshold,
                     "score_over_threshold": None if threshold is None else float(score / threshold),
                     "max_patch": float(patch_stats["max"]),
+                    "alignment_method": alignment.method,
                     "feature_inlier_ratio": float(alignment.feature_inlier_ratio),
                     "ecc_score": "" if alignment.ecc_score is None else float(alignment.ecc_score),
                     "dino_seconds": dino_s,
@@ -230,14 +269,24 @@ def main() -> None:
                     f"{'D' if pred_defect else 'N'}"
                 )
 
-            image_ok = predicted_defects == defect_rois
             valid_images += 1
-            image_correct += int(image_ok)
-            truth_text = "GOOD" if not defect_rois else "+".join(sorted(defect_rois))
+            if defect_rois is None:
+                generic_ng_images += 1
+                image_ok = bool(predicted_defects)
+                generic_ng_detected += int(image_ok)
+                truth_text = "NG(any)"
+                result_label = "DETECTED" if image_ok else "MISS"
+            else:
+                exact_labeled_images += 1
+                image_ok = predicted_defects == defect_rois
+                exact_labeled_correct += int(image_ok)
+                truth_text = "GOOD" if not defect_rois else "+".join(sorted(defect_rois))
+                result_label = "OK" if image_ok else "MISS"
+
             pred_text = "GOOD" if not predicted_defects else "+".join(sorted(predicted_defects))
             print(
                 f"[{idx}/{len(scenarios)}] {scenario:<22} {image_path.name:<24} "
-                f"truth={truth_text:<10} pred={pred_text:<10} {'OK' if image_ok else 'MISS'}",
+                f"truth={truth_text:<10} pred={pred_text:<10} {result_label}",
                 flush=True,
             )
             print("    " + "  ".join(detail), flush=True)
@@ -246,6 +295,7 @@ def main() -> None:
             failed_images += 1
             rows.append({
                 "scenario": scenario,
+                "scenario_mode": "GENERIC_NG" if defect_rois is None else "EXACT_ROI",
                 "source": str(image_path),
                 "roi_id": "",
                 "truth": "",
@@ -255,6 +305,7 @@ def main() -> None:
                 "threshold": "",
                 "score_over_threshold": "",
                 "max_patch": "",
+                "alignment_method": "",
                 "feature_inlier_ratio": "",
                 "ecc_score": "",
                 "dino_seconds": "",
@@ -265,8 +316,8 @@ def main() -> None:
 
     csv_path = out / "scores_strict.csv"
     fieldnames = [
-        "scenario", "source", "roi_id", "truth", "prediction", "correct",
-        "score", "threshold", "score_over_threshold", "max_patch",
+        "scenario", "scenario_mode", "source", "roi_id", "truth", "prediction", "correct",
+        "score", "threshold", "score_over_threshold", "max_patch", "alignment_method",
         "feature_inlier_ratio", "ecc_score", "dino_seconds", "status", "error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -275,8 +326,12 @@ def main() -> None:
         writer.writerows(rows)
 
     print("", flush=True)
-    print("=== Per-ROI TRUE state separation ===", flush=True)
-    print(f"{'ROI':<8} {'NORMAL min':>11} {'NORMAL mean':>11} {'NORMAL max':>11} {'DEFECT min':>11} {'DEFECT mean':>11} {'DEFECT max':>11} {'Threshold':>11}", flush=True)
+    print("=== Per-ROI TRUE state separation (exact labels only) ===", flush=True)
+    print(
+        f"{'ROI':<8} {'NORMAL min':>11} {'NORMAL mean':>11} {'NORMAL max':>11} "
+        f"{'DEFECT min':>11} {'DEFECT mean':>11} {'DEFECT max':>11} {'Threshold':>11}",
+        flush=True,
+    )
     print("-" * 101, flush=True)
 
     roi_summary = {}
@@ -305,16 +360,20 @@ def main() -> None:
 
     total_s = time.perf_counter() - total_start
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_dir": str(model_dir),
         "test_root": str(test_root),
         "image_level": {
             "valid": valid_images,
             "failed": failed_images,
-            "exact_roi_set_correct": image_correct,
-            "exact_roi_set_accuracy": None if not valid_images else image_correct / valid_images,
+            "exact_labeled_images": exact_labeled_images,
+            "exact_roi_set_correct": exact_labeled_correct,
+            "exact_roi_set_accuracy": None if not exact_labeled_images else exact_labeled_correct / exact_labeled_images,
+            "generic_ng_images": generic_ng_images,
+            "generic_ng_detected": generic_ng_detected,
+            "generic_ng_detection_rate": None if not generic_ng_images else generic_ng_detected / generic_ng_images,
         },
-        "roi_level": {
+        "roi_level_exact_labels_only": {
             "normal_roi_total": normal_roi_total,
             "defect_roi_total": defect_roi_total,
             "false_alarm_rois": false_alarm_rois,
@@ -328,20 +387,45 @@ def main() -> None:
             "mean_dino_per_valid_image": None if not valid_images else total_dino / valid_images,
         },
         "rois": roi_summary,
+        "notes": [
+            "all_empty is treated as all currently modeled ROIs being defective.",
+            "missing_screws and excess_screws are generic image-level NG folders when filenames do not encode the exact ROI.",
+            "Generic NG samples are excluded from per-ROI false-alarm and miss-rate statistics.",
+            "With only S01/S02 models, excess screws outside S01/S02 are not expected to be detectable yet.",
+        ],
     }
     summary_path = out / "summary_strict.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("", flush=True)
-    print("=== Strict summary ===", flush=True)
-    print(f"Valid images:       {valid_images}", flush=True)
-    print(f"Failed images:      {failed_images}", flush=True)
-    print(f"Exact image result: {image_correct}/{valid_images}" if valid_images else "Exact image result: -", flush=True)
-    print(f"False-alarm ROIs:   {false_alarm_rois}/{normal_roi_total}" if normal_roi_total else "False-alarm ROIs:   -", flush=True)
-    print(f"Missed defect ROIs: {missed_defect_rois}/{defect_roi_total}" if defect_roi_total else "Missed defect ROIs: -", flush=True)
-    print(f"Mean DINO/image:    {total_dino / valid_images:.3f}s" if valid_images else "Mean DINO/image:    -", flush=True)
-    print(f"CSV:                {csv_path}", flush=True)
-    print(f"JSON:               {summary_path}", flush=True)
+    print("=== Evaluation summary ===", flush=True)
+    print(f"Valid images:            {valid_images}", flush=True)
+    print(f"Failed images:           {failed_images}", flush=True)
+    if exact_labeled_images:
+        print(f"Exact labeled result:    {exact_labeled_correct}/{exact_labeled_images}", flush=True)
+    else:
+        print("Exact labeled result:    -", flush=True)
+    if generic_ng_images:
+        print(f"Generic NG detected:     {generic_ng_detected}/{generic_ng_images}", flush=True)
+    else:
+        print("Generic NG detected:     -", flush=True)
+    print(
+        f"False-alarm ROIs:        {false_alarm_rois}/{normal_roi_total}"
+        if normal_roi_total else "False-alarm ROIs:        -",
+        flush=True,
+    )
+    print(
+        f"Missed defect ROIs:      {missed_defect_rois}/{defect_roi_total}"
+        if defect_roi_total else "Missed defect ROIs:      -",
+        flush=True,
+    )
+    print(
+        f"Mean DINO/image:         {total_dino / valid_images:.3f}s"
+        if valid_images else "Mean DINO/image:         -",
+        flush=True,
+    )
+    print(f"CSV:                     {csv_path}", flush=True)
+    print(f"JSON:                    {summary_path}", flush=True)
 
 
 if __name__ == "__main__":
