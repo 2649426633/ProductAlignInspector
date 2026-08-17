@@ -7,8 +7,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -42,33 +40,31 @@ def classify_group(roi_id: str) -> str:
 def scenario_policy(name: str, groups: dict[str, set[str]]) -> tuple[str, set[str], bool]:
     """Return (mode, target_rois, require_all_targets).
 
-    GOOD: exact all-normal.
-    all_empty: all expected-screw S* ROIs should be anomalous; E*/SPRING* stay normal.
-    missing_screws: location unknown, detect if any S* ROI is anomalous.
-    excess_screws: location unknown, detect if any E* ROI is anomalous.
-    missing_springs/spring_missing: location unknown, detect if any SPRING* ROI is anomalous.
-    Unknown NG folders fall back to any-ROI image-level detection.
+    Product rules:
+      Sxx = expected screw. A defect means the required screw state changed.
+      Exx = expected empty. A defect means an unexpected screw/object appeared.
+      SPRINGxx = ignored for the current product decision.
+
+    Dataset folder names only provide category-level truth, not exact per-ROI truth.
+    Therefore we evaluate whether the relevant S/E group detects the scenario and
+    do not treat detections in other S/E ROIs as false/off-target errors.
     """
     lower = name.strip().lower()
     if lower == "good":
-        return "GOOD_EXACT", set(), False
+        return "GOOD", set(), False
     if lower in {"all_empty", "all_missing", "all_screws_empty"}:
         return "SCREW_ALL", set(groups["SCREW"]), True
     if lower in {"missing_screws", "missing_screw"}:
         return "SCREW_ANY", set(groups["SCREW"]), False
     if lower in {"excess_screws", "extra_screws", "excess_screw", "extra_screw"}:
         return "EMPTY_ANY", set(groups["EMPTY"]), False
-    if lower in {"missing_springs", "missing_spring", "spring_missing"}:
-        return "SPRING_ANY", set(groups["SPRING"]), False
-    return "GENERIC_ANY", set().union(*groups.values()), False
-
-
-def fmt(v: float | None) -> str:
-    return "-" if v is None else f"{v:.6f}"
+    return "PRODUCT_ANY", set(groups["SCREW"]) | set(groups["EMPTY"]), False
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Group-aware full-product ROI DINOv2/PatchCore evaluation.")
+    p = argparse.ArgumentParser(
+        description="Evaluate product rules: S=must have screw, E=must be empty; spring ROIs are ignored."
+    )
     p.add_argument("--test-root", required=True)
     p.add_argument("--model-dir", default="artifacts/roi_dino_full")
     p.add_argument("--reference")
@@ -85,13 +81,19 @@ def main() -> None:
     test_root = Path(args.test_root)
     model_dir = Path(args.model_dir)
     manifest = read_model_manifest(model_dir)
-    models = [load_roi_model(model_dir, str(item["id"])) for item in manifest.get("rois", [])]
-    if not models:
+    all_models = [load_roi_model(model_dir, str(item["id"])) for item in manifest.get("rois", [])]
+    if not all_models:
         raise RuntimeError("No ROI models in model.json")
 
     groups: dict[str, set[str]] = {"SCREW": set(), "EMPTY": set(), "SPRING": set(), "OTHER": set()}
-    for model in models:
+    for model in all_models:
         groups[classify_group(model.roi_id)].add(model.roi_id)
+
+    # Current production decision only uses S/E. Spring quantity/state is postponed.
+    models = [m for m in all_models if classify_group(m.roi_id) in {"SCREW", "EMPTY"}]
+    ignored_models = [m for m in all_models if m not in models]
+    if not models:
+        raise RuntimeError("No S/E ROI models found. Expected Sxx and/or Exx banks.")
 
     scenarios: list[tuple[str, Path]] = []
     for image in collect_images(test_root / "good"):
@@ -128,21 +130,24 @@ def main() -> None:
 
     valid = 0
     failed = 0
-    good_total = good_ok = 0
-    ng_total = ng_detected = 0
-    target_total = target_detected = 0
-    exact_total = exact_ok = 0
+    good_total = 0
+    good_ok = 0
     good_false_alarm_rois = 0
     good_roi_total = 0
-    off_target_defects = 0
+    ng_total = 0
+    ng_detected = 0
+    scenario_stats: dict[str, dict[str, int]] = {}
     total_dino = 0.0
     t_all = time.perf_counter()
 
-    print("=== Full ROI DINOv2 / PatchCore Evaluation ===", flush=True)
-    print(f"Images: {len(scenarios)}", flush=True)
-    print(f"SCREW ROIs:  {sorted(groups['SCREW'])}", flush=True)
-    print(f"EMPTY ROIs:  {sorted(groups['EMPTY'])}", flush=True)
-    print(f"SPRING ROIs: {sorted(groups['SPRING'])}", flush=True)
+    print("=== Product Rule Evaluation ===", flush=True)
+    print("Rule: Sxx must HAVE screw; Exx must be EMPTY.", flush=True)
+    print("SPRING ROIs are ignored for now.", flush=True)
+    print(f"Images:       {len(scenarios)}", flush=True)
+    print(f"SCREW ROIs:   {sorted(groups['SCREW'])}", flush=True)
+    print(f"EMPTY ROIs:   {sorted(groups['EMPTY'])}", flush=True)
+    print(f"Ignored ROIs: {[m.roi_id for m in ignored_models]}", flush=True)
+    print(f"Decision ROI count: {len(models)}", flush=True)
     print("", flush=True)
 
     for idx, (scenario, image_path) in enumerate(scenarios, 1):
@@ -169,7 +174,6 @@ def main() -> None:
             total_dino += dino_s
 
             predicted: set[str] = set()
-            score_map: dict[str, tuple[float, float | None]] = {}
             for model, tokens in zip(models, token_batch):
                 score, _heat, _stats = score_patch_tokens(
                     tokens,
@@ -181,15 +185,24 @@ def main() -> None:
                 is_defect = threshold is not None and score > threshold
                 if is_defect:
                     predicted.add(model.roi_id)
-                score_map[model.roi_id] = (float(score), threshold)
+
+                roi_group = classify_group(model.roi_id)
+                if roi_group == "SCREW":
+                    expected = "SCREW_PRESENT"
+                    defect_meaning = "MISSING_OR_WRONG_SCREW"
+                else:
+                    expected = "EMPTY"
+                    defect_meaning = "UNEXPECTED_SCREW_OR_OBJECT"
+
                 rows.append({
                     "scenario": scenario,
                     "mode": mode,
                     "source": str(image_path),
                     "roi_id": model.roi_id,
-                    "roi_group": classify_group(model.roi_id),
-                    "target_roi": model.roi_id in targets,
+                    "roi_group": roi_group,
+                    "expected": expected,
                     "prediction": "DEFECT" if is_defect else "NORMAL",
+                    "defect_meaning": defect_meaning if is_defect else "",
                     "score": float(score),
                     "threshold": threshold,
                     "score_over_threshold": None if threshold is None else float(score / threshold),
@@ -202,41 +215,31 @@ def main() -> None:
                 })
 
             valid += 1
-            target_preds = predicted & targets
-            off_target = predicted - targets
-
-            if mode == "GOOD_EXACT":
+            if mode == "GOOD":
                 good_total += 1
                 good_roi_total += len(models)
                 good_false_alarm_rois += len(predicted)
                 image_ok = not predicted
                 good_ok += int(image_ok)
-                exact_total += 1
-                exact_ok += int(image_ok)
-                result = "OK" if image_ok else "FALSE_ALARM"
+                result = "PASS" if image_ok else "FALSE_ALARM"
             else:
                 ng_total += 1
+                target_preds = predicted & targets
                 if require_all:
-                    image_detected = bool(targets) and targets.issubset(predicted)
-                    exact_match = predicted == targets
-                    exact_total += 1
-                    exact_ok += int(exact_match)
+                    detected = bool(targets) and targets.issubset(predicted)
                 else:
-                    image_detected = bool(target_preds) if targets else bool(predicted)
-                    exact_match = None
-                ng_detected += int(image_detected)
-                target_total += 1
-                target_detected += int(image_detected)
-                off_target_defects += len(off_target)
-                result = "DETECTED" if image_detected else "MISS"
-                if require_all and image_detected and not exact_match:
-                    result = "DETECTED+OFFTARGET"
+                    detected = bool(target_preds) if targets else bool(predicted)
+                ng_detected += int(detected)
+                result = "DETECTED" if detected else "MISS"
+                stat = scenario_stats.setdefault(scenario, {"total": 0, "detected": 0})
+                stat["total"] += 1
+                stat["detected"] += int(detected)
 
-            pred_text = "GOOD" if not predicted else "+".join(sorted(predicted))
-            target_text = "-" if not targets else "+".join(sorted(targets))
+            screw_pred = sorted(predicted & groups["SCREW"])
+            empty_pred = sorted(predicted & groups["EMPTY"])
             print(
                 f"[{idx}/{len(scenarios)}] {scenario:<18} {image_path.name:<24} "
-                f"mode={mode:<11} target={target_text:<18} pred={pred_text:<45} {result}",
+                f"S={'+'.join(screw_pred) or '-':<10} E={'+'.join(empty_pred) or '-':<32} {result}",
                 flush=True,
             )
 
@@ -248,8 +251,9 @@ def main() -> None:
                 "source": str(image_path),
                 "roi_id": "",
                 "roi_group": "",
-                "target_roi": "",
+                "expected": "",
                 "prediction": "",
+                "defect_meaning": "",
                 "score": "",
                 "threshold": "",
                 "score_over_threshold": "",
@@ -262,11 +266,11 @@ def main() -> None:
             })
             print(f"[{idx}/{len(scenarios)}] {image_path.name} -> FAILED: {exc}", flush=True)
 
-    csv_path = out / "scores_full.csv"
+    csv_path = out / "scores_product_rules.csv"
     fieldnames = [
-        "scenario", "mode", "source", "roi_id", "roi_group", "target_roi", "prediction",
-        "score", "threshold", "score_over_threshold", "alignment_method", "feature_inlier_ratio",
-        "ecc_score", "dino_seconds", "status", "error",
+        "scenario", "mode", "source", "roi_id", "roi_group", "expected", "prediction",
+        "defect_meaning", "score", "threshold", "score_over_threshold", "alignment_method",
+        "feature_inlier_ratio", "ecc_score", "dino_seconds", "status", "error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -275,50 +279,55 @@ def main() -> None:
 
     total_s = time.perf_counter() - t_all
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "product_rules": {
+            "S": "must_have_screw",
+            "E": "must_be_empty",
+            "SPRING": "ignored_for_now",
+        },
         "model_dir": str(model_dir),
         "test_root": str(test_root),
-        "groups": {k: sorted(v) for k, v in groups.items()},
+        "decision_rois": [m.roi_id for m in models],
+        "ignored_rois": [m.roi_id for m in ignored_models],
         "images": {"valid": valid, "failed": failed},
         "good": {
             "total": good_total,
             "pass": good_ok,
             "false_alarm_images": good_total - good_ok,
-            "roi_total": good_roi_total,
+            "decision_roi_total": good_roi_total,
             "false_alarm_rois": good_false_alarm_rois,
         },
         "ng": {
             "total": ng_total,
             "detected": ng_detected,
             "missed": ng_total - ng_detected,
-            "target_tests": target_total,
-            "target_detected": target_detected,
-            "off_target_defect_predictions": off_target_defects,
         },
-        "exact": {
-            "total": exact_total,
-            "correct": exact_ok,
-        },
+        "scenario_detection": scenario_stats,
         "timing_seconds": {
             "total": total_s,
             "dino_total": total_dino,
             "mean_dino_per_valid_image": None if not valid else total_dino / valid,
         },
     }
-    summary_path = out / "summary_full.json"
+    summary_path = out / "summary_product_rules.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("", flush=True)
-    print("=== Full evaluation summary ===", flush=True)
-    print(f"Valid / failed:          {valid} / {failed}", flush=True)
-    print(f"GOOD pass:               {good_ok}/{good_total}" if good_total else "GOOD pass:               -", flush=True)
-    print(f"GOOD false-alarm ROIs:   {good_false_alarm_rois}/{good_roi_total}" if good_roi_total else "GOOD false-alarm ROIs:   -", flush=True)
-    print(f"NG detected:             {ng_detected}/{ng_total}" if ng_total else "NG detected:             -", flush=True)
-    print(f"Exact result:            {exact_ok}/{exact_total}" if exact_total else "Exact result:            -", flush=True)
-    print(f"Off-target predictions:  {off_target_defects}", flush=True)
-    print(f"Mean DINO/image:         {total_dino / valid:.3f}s" if valid else "Mean DINO/image:         -", flush=True)
-    print(f"CSV:                     {csv_path}", flush=True)
-    print(f"JSON:                    {summary_path}", flush=True)
+    print("=== Product-rule evaluation summary ===", flush=True)
+    print(f"Valid / failed:        {valid} / {failed}", flush=True)
+    print(f"GOOD pass:             {good_ok}/{good_total}" if good_total else "GOOD pass:             -", flush=True)
+    print(
+        f"GOOD false-alarm ROI:  {good_false_alarm_rois}/{good_roi_total} (S/E only)"
+        if good_roi_total else "GOOD false-alarm ROI:  -",
+        flush=True,
+    )
+    for name in sorted(scenario_stats):
+        st = scenario_stats[name]
+        print(f"{name:<22} {st['detected']}/{st['total']} detected", flush=True)
+    print(f"NG detected overall:   {ng_detected}/{ng_total}" if ng_total else "NG detected overall:   -", flush=True)
+    print(f"Mean DINO/image:       {total_dino / valid:.3f}s" if valid else "Mean DINO/image:       -", flush=True)
+    print(f"CSV:                   {csv_path}", flush=True)
+    print(f"JSON:                  {summary_path}", flush=True)
 
 
 if __name__ == "__main__":
