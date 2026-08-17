@@ -15,9 +15,15 @@ class ProductLocatorConfig:
     close_kernel_ratio: float = 0.006
     crop_padding_ratio: float = 0.08
 
-    # Foreground/PCA is only a fallback. A false PCA angle can rotate the
-    # product by tens of degrees, so never trust a large coarse angle.
-    max_abs_coarse_rotation_deg: float = 15.0
+    # Foreground/PCA is only a fallback. The PCA axis itself is usable for
+    # large rotations, but its direction has 180-degree ambiguity and may
+    # occasionally flip by 90 degrees on near-symmetric products. Runtime
+    # fallback therefore searches quadrant candidates against the reference.
+    max_abs_coarse_rotation_deg: float = 90.0
+    fallback_quadrant_search: bool = True
+    fallback_preview_max_dim: int = 900
+    fallback_preview_ecc_iterations: int = 80
+    fallback_full_ecc_iterations: int = 350
 
     # Primary alignment: match the canonical reference directly against the
     # full input image. This is robust to arbitrary X/Y position and avoids
@@ -32,8 +38,8 @@ class ProductLocatorConfig:
     feature_min_scale: float = 0.70
     feature_max_scale: float = 1.30
 
-    # ECC is used only as a small refinement after feature alignment.
-    # If its score is weak, keep the strict feature result instead of damaging it.
+    # ECC is used as an independent whole-image quality gate. In particular,
+    # the foreground fallback is never accepted below this score.
     ecc_accept_score: float = 0.75
 
 
@@ -64,6 +70,7 @@ class AlignmentResult:
     feature_inliers: int = 0
     feature_inlier_ratio: float = 0.0
     feature_matrix: np.ndarray | None = None
+    fallback_rotation_deg: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +80,9 @@ class AlignmentResult:
             "feature_inliers": int(self.feature_inliers),
             "feature_inlier_ratio": float(self.feature_inlier_ratio),
             "feature_matrix": None if self.feature_matrix is None else self.feature_matrix.tolist(),
+            "fallback_rotation_deg": None
+            if self.fallback_rotation_deg is None
+            else float(self.fallback_rotation_deg),
             "ecc_score": None if self.ecc_score is None else float(self.ecc_score),
             "ecc_matrix": None if self.ecc_matrix is None else self.ecc_matrix.tolist(),
             "aligned_shape": list(self.aligned.shape),
@@ -200,6 +210,32 @@ def _rotate_about(
     )
 
 
+def _rotate_about_bound(
+    image: np.ndarray,
+    center: tuple[float, float],
+    angle_deg: float,
+    border_value: int = 255,
+) -> np.ndarray:
+    """Rotate without clipping a large diagonal product at the original canvas edges."""
+    h, w = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos_value = abs(float(matrix[0, 0]))
+    sin_value = abs(float(matrix[0, 1]))
+    new_w = max(1, int(np.ceil(h * sin_value + w * cos_value)))
+    new_h = max(1, int(np.ceil(h * cos_value + w * sin_value)))
+    matrix[0, 2] += new_w / 2.0 - center[0]
+    matrix[1, 2] += new_h / 2.0 - center[1]
+    border = (border_value, border_value, border_value) if image.ndim == 3 else border_value
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border,
+    )
+
+
 def _crop_with_padding(
     image: np.ndarray,
     bbox: tuple[int, int, int, int],
@@ -215,30 +251,47 @@ def _crop_with_padding(
     return image[y0:y1, x0:x1].copy()
 
 
+def _foreground_candidate(
+    image: np.ndarray,
+    initial: ProductLocation,
+    cfg: ProductLocatorConfig,
+    rotation_deg: float,
+    target_size: tuple[int, int] | None,
+) -> np.ndarray:
+    rotated = (
+        _rotate_about_bound(image, initial.center_xy, rotation_deg)
+        if abs(rotation_deg) > 1e-3
+        else image.copy()
+    )
+    rotated_location = locate_product(rotated, cfg)
+    crop = _crop_with_padding(rotated, rotated_location.bbox_xywh, cfg.crop_padding_ratio)
+    if crop.size == 0:
+        raise RuntimeError("Foreground fallback produced an empty crop.")
+
+    if target_size is not None:
+        interpolation = cv2.INTER_AREA if crop.shape[1] > target_size[0] else cv2.INTER_CUBIC
+        crop = cv2.resize(crop, target_size, interpolation=interpolation)
+    return crop
+
+
 def coarse_align(
     image: np.ndarray,
     cfg: ProductLocatorConfig | None = None,
     target_size: tuple[int, int] | None = None,
 ) -> tuple[np.ndarray, ProductLocation, np.ndarray]:
-    """Foreground-based fallback alignment.
+    """Foreground/PCA normalization used for reference creation and fallback seeding.
 
-    Large PCA angles are treated as unreliable segmentation/orientation results.
-    This prevents errors such as -56 degrees from rotating a nearly horizontal
-    product into a completely wrong pose.
+    Unlike the old implementation, large PCA angles are not silently ignored.
+    The rotation is performed on an expanded canvas so a 40-60 degree product
+    is not clipped. Runtime alignment resolves PCA direction ambiguity against
+    the actual reference before accepting a fallback result.
     """
     cfg = cfg or ProductLocatorConfig()
     initial = locate_product(image, cfg)
 
-    rotation = -initial.angle_deg if abs(initial.angle_deg) <= cfg.max_abs_coarse_rotation_deg else 0.0
-    rotated = _rotate_about(image, initial.center_xy, rotation) if abs(rotation) > 1e-3 else image.copy()
-
-    rotated_location = locate_product(rotated, cfg)
-    crop = _crop_with_padding(rotated, rotated_location.bbox_xywh, cfg.crop_padding_ratio)
-
-    if target_size is not None:
-        interpolation = cv2.INTER_AREA if crop.shape[1] > target_size[0] else cv2.INTER_CUBIC
-        crop = cv2.resize(crop, target_size, interpolation=interpolation)
-
+    limit = max(0.0, float(cfg.max_abs_coarse_rotation_deg))
+    rotation = float(np.clip(-initial.angle_deg, -limit, limit)) if limit > 0.0 else 0.0
+    crop = _foreground_candidate(image, initial, cfg, rotation, target_size)
     return crop, initial, initial.mask
 
 
@@ -420,6 +473,136 @@ def _ecc_refine(
         return moving.copy(), None, None
 
 
+def _preview_pair(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    max_dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    h, w = reference.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(h, w))) if max_dim > 0 else 1.0
+    if scale >= 0.9999:
+        if moving.shape[:2] != reference.shape[:2]:
+            moving = cv2.resize(moving, (w, h), interpolation=cv2.INTER_AREA)
+        return reference, moving
+
+    size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    return (
+        cv2.resize(reference, size, interpolation=cv2.INTER_AREA),
+        cv2.resize(moving, size, interpolation=cv2.INTER_AREA),
+    )
+
+
+def _foreground_fallback_result(
+    image: np.ndarray,
+    reference: np.ndarray,
+    cfg: ProductLocatorConfig,
+    ecc_iterations: int,
+    ecc_epsilon: float,
+    motion: int,
+) -> AlignmentResult:
+    """Resolve the PCA orientation ambiguity against the canonical reference.
+
+    The old fallback ignored PCA angles above 15 degrees and could return a
+    visibly diagonal image as a successful alignment. Here we normalize the
+    PCA axis, try quadrant alternatives, rank them with a small ECC preview,
+    and require full-resolution ECC confirmation before returning success.
+    """
+    initial = locate_product(image, cfg)
+    target_size = (reference.shape[1], reference.shape[0])
+    base_rotation = -float(initial.angle_deg)
+
+    raw_rotations = [base_rotation]
+    if cfg.fallback_quadrant_search:
+        raw_rotations.extend(base_rotation + offset for offset in (90.0, 180.0, 270.0))
+
+    rotations: list[float] = []
+    for raw in raw_rotations:
+        normalized = float((raw + 180.0) % 360.0 - 180.0)
+        if not any(abs(normalized - existing) < 1e-4 for existing in rotations):
+            rotations.append(normalized)
+
+    candidates: list[tuple[float, float, np.ndarray]] = []
+    preview_iterations = max(40, int(cfg.fallback_preview_ecc_iterations))
+    preview_epsilon = max(float(ecc_epsilon), 1e-5)
+
+    for rotation in rotations:
+        try:
+            coarse = _foreground_candidate(image, initial, cfg, rotation, target_size)
+            preview_ref, preview_moving = _preview_pair(
+                reference,
+                coarse,
+                int(cfg.fallback_preview_max_dim),
+            )
+            _, preview_score, _ = _ecc_refine(
+                preview_ref,
+                preview_moving,
+                preview_iterations,
+                preview_epsilon,
+                motion,
+            )
+        except (RuntimeError, cv2.error):
+            continue
+
+        score_for_sort = -1.0 if preview_score is None else float(preview_score)
+        candidates.append((score_for_sort, rotation, coarse))
+
+    if not candidates:
+        raise RuntimeError("Foreground fallback failed: no valid orientation candidates.")
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    full_iterations = max(int(ecc_iterations), int(cfg.fallback_full_ecc_iterations))
+    best_score: float | None = None
+    best_rotation: float | None = None
+
+    # Usually the preview picks the correct orientation immediately. Evaluate
+    # the best two first; only pay for the remaining candidates if neither one
+    # passes the production ECC quality gate.
+    groups = [candidates[:2], candidates[2:]]
+    for group in groups:
+        accepted: list[tuple[float, float, np.ndarray, np.ndarray, np.ndarray]] = []
+        for _, rotation, coarse in group:
+            refined, full_score, full_matrix = _ecc_refine(
+                reference,
+                coarse,
+                full_iterations,
+                ecc_epsilon,
+                motion,
+            )
+            if full_score is not None and (best_score is None or full_score > best_score):
+                best_score = float(full_score)
+                best_rotation = float(rotation)
+            if (
+                full_score is not None
+                and full_matrix is not None
+                and full_score >= cfg.ecc_accept_score
+            ):
+                accepted.append(
+                    (float(full_score), float(rotation), coarse, refined, full_matrix)
+                )
+
+        if accepted:
+            accepted.sort(key=lambda item: item[0], reverse=True)
+            full_score, rotation, coarse, refined, full_matrix = accepted[0]
+            return AlignmentResult(
+                aligned=refined,
+                coarse=coarse,
+                foreground_mask=initial.mask,
+                location=initial,
+                ecc_score=full_score,
+                ecc_matrix=full_matrix,
+                method="foreground_quadrant+ecc",
+                fallback_rotation_deg=rotation,
+            )
+
+    score_text = "none" if best_score is None else f"{best_score:.4f}"
+    rotation_text = "none" if best_rotation is None else f"{best_rotation:.2f} deg"
+    raise RuntimeError(
+        "Foreground fallback alignment rejected: "
+        f"best ECC={score_text} < {cfg.ecc_accept_score:.2f}, "
+        f"rotation={rotation_text}."
+    )
+
+
 def _feature_result(
     image: np.ndarray,
     reference: np.ndarray,
@@ -488,15 +671,14 @@ def align_to_reference(
       1. strict SIFT/RANSAC using the configured production limits;
       2. staged detail/relaxed/ultra SIFT recovery, accepted only when ECC
          independently confirms the whole-image alignment;
-      3. foreground/PCA fallback as the final legacy fallback.
+      3. foreground/PCA quadrant recovery, also accepted only when full ECC
+         confirms the alignment.
 
-    Strict SIFT remains the fast path, so normal production images do not pay
-    the cost of the recovery presets. The recovery presets intentionally use
-    stronger ECC gates (0.80 / 0.85) because their feature inlier-ratio limits
-    are weaker than the normal 0.25 production threshold.
+    A failed foreground fallback now raises RuntimeError instead of returning a
+    visibly wrong crop as if it were a successful alignment. Batch tools catch
+    that exception and mark the image as failed, preventing bad ROI training data.
     """
     cfg = cfg or ProductLocatorConfig()
-    target_size = (reference.shape[1], reference.shape[0])
 
     strict = _feature_result(
         image,
@@ -557,7 +739,6 @@ def align_to_reference(
         ),
     ]
 
-    # Recovery ECC gets a few more iterations than the strict fast path.
     recovery_iterations = max(300, ecc_iterations)
     for name, recovery_cfg, ecc_accept in recovery_presets:
         recovered = _feature_result(
@@ -574,31 +755,13 @@ def align_to_reference(
         if recovered is not None:
             return recovered
 
-    coarse, location, original_mask = coarse_align(image, cfg, target_size=target_size)
-    refined, ecc_score, ecc_matrix = _ecc_refine(
+    return _foreground_fallback_result(
+        image,
         reference,
-        coarse,
-        ecc_iterations,
-        ecc_epsilon,
-        motion,
-    )
-
-    if ecc_score is not None and ecc_score >= cfg.ecc_accept_score:
-        aligned = refined
-        method = "foreground_fallback+ecc"
-    else:
-        aligned = coarse
-        method = "foreground_fallback"
-        ecc_matrix = None
-
-    return AlignmentResult(
-        aligned=aligned,
-        coarse=coarse,
-        foreground_mask=original_mask,
-        location=location,
-        ecc_score=ecc_score,
-        ecc_matrix=ecc_matrix,
-        method=method,
+        cfg,
+        ecc_iterations=recovery_iterations,
+        ecc_epsilon=ecc_epsilon,
+        motion=motion,
     )
 
 
