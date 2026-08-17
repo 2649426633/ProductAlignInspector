@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "description": "Production decision threshold multipliers for S/E ROIs. Effective threshold = calibrated_threshold * global_threshold_scale * roi_multiplier.",
+  "default_multiplier": 1.0,
+  "roi_multipliers": {
+    "S01": 1.10,
+    "E01": 1.10,
+    "E07": 1.25
+  }
+}
