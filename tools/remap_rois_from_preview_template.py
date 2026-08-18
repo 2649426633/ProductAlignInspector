@@ -16,17 +16,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from product_align_inspector.io_utils import read_image, write_image
 
-# Exact BGR colors used by tools/annotate_rois.py when writing *_preview.png.
-COLOR_S = np.array([60, 210, 60], dtype=np.uint8)
-COLOR_E = np.array([0, 170, 255], dtype=np.uint8)
-COLOR_P = np.array([255, 120, 40], dtype=np.uint8)
+# BGR colors used by tools/annotate_rois.py. We use a tolerance instead of
+# requiring exact pixels because old previews may have been re-saved.
+COLOR_S = np.array([60, 210, 60], dtype=np.int16)
+COLOR_E = np.array([0, 170, 255], dtype=np.int16)
+COLOR_P = np.array([255, 120, 40], dtype=np.int16)
 
 
 @dataclass
 class Orientation:
     name: str
     image: np.ndarray
-    source_to_oriented: np.ndarray  # 3x3 homography
+    source_to_oriented: np.ndarray
 
 
 def _orientation_candidates(image: np.ndarray) -> list[Orientation]:
@@ -35,7 +36,6 @@ def _orientation_candidates(image: np.ndarray) -> list[Orientation]:
     hflip = np.array([[-1.0, 0.0, w - 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
     vflip = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, h - 1.0], [0.0, 0.0, 1.0]], dtype=np.float64)
     rot180 = vflip @ hflip
-
     return [
         Orientation("identity", image.copy(), eye),
         Orientation("hflip", cv2.flip(image, 1), hflip),
@@ -44,39 +44,50 @@ def _orientation_candidates(image: np.ndarray) -> list[Orientation]:
     ]
 
 
+def _color_mask(image: np.ndarray, color: np.ndarray, tolerance: int = 18) -> np.ndarray:
+    c = color.astype(np.int16)
+    lower = np.clip(c - tolerance, 0, 255).astype(np.uint8)
+    upper = np.clip(c + tolerance, 0, 255).astype(np.uint8)
+    return cv2.inRange(image, lower, upper)
+
+
 def _annotation_mask(image: np.ndarray) -> np.ndarray:
-    # PNG preview keeps the main rectangle/text pixels at their exact BGR values.
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
     for color in (COLOR_S, COLOR_E, COLOR_P):
-        exact = cv2.inRange(image, color, color)
-        mask = cv2.bitwise_or(mask, exact)
-    # Exclude anti-aliased fringe around annotation graphics from feature extraction.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        mask = cv2.bitwise_or(mask, _color_mask(image, color, tolerance=22))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     return cv2.dilate(mask, kernel, iterations=1)
 
 
-def _detect_preview_rectangles(image: np.ndarray, color: np.ndarray, expected_count: int) -> list[list[int]]:
-    exact = cv2.inRange(image, color, color)
-    # Close tiny anti-aliased gaps in rectangle strokes.
-    exact = cv2.morphologyEx(exact, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(exact, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+def _detect_preview_rectangles(
+    image: np.ndarray,
+    color: np.ndarray,
+    expected_count: int,
+    *,
+    required: bool,
+) -> list[list[int]]:
+    if expected_count <= 0:
+        return []
+
+    mask = _color_mask(image, color, tolerance=22)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     h, w = image.shape[:2]
-    min_w = max(20, int(round(w * 0.015)))
-    min_h = max(20, int(round(h * 0.015)))
-    max_w = int(round(w * 0.35))
-    max_h = int(round(h * 0.35))
+    min_w = max(18, int(round(w * 0.012)))
+    min_h = max(18, int(round(h * 0.012)))
+    max_w = int(round(w * 0.40))
+    max_h = int(round(h * 0.40))
+
     candidates: list[list[int]] = []
     for contour in contours:
         x, y, cw, ch = cv2.boundingRect(contour)
         if not (min_w <= cw <= max_w and min_h <= ch <= max_h):
             continue
-        # A true ROI rectangle has a contour/bounding-box area relationship unlike text glyphs.
         perimeter = cv2.arcLength(contour, True)
-        if perimeter < 2.0 * (cw + ch) * 0.45:
+        if perimeter < 2.0 * (cw + ch) * 0.38:
             continue
         candidates.append([int(x), int(y), int(cw), int(ch)])
 
-    # Deduplicate nested inner/outer stroke contours by center proximity and size similarity.
     candidates.sort(key=lambda r: r[2] * r[3], reverse=True)
     kept: list[list[int]] = []
     for rect in candidates:
@@ -86,18 +97,16 @@ def _detect_preview_rectangles(image: np.ndarray, color: np.ndarray, expected_co
         for other in kept:
             ox, oy, ow, oh = other
             ocx, ocy = ox + ow / 2.0, oy + oh / 2.0
-            if abs(cx - ocx) <= 8 and abs(cy - ocy) <= 8 and abs(cw - ow) <= 14 and abs(ch - oh) <= 14:
+            if abs(cx - ocx) <= 10 and abs(cy - ocy) <= 10 and abs(cw - ow) <= 18 and abs(ch - oh) <= 18:
                 duplicate = True
                 break
         if not duplicate:
             kept.append(rect)
 
-    if len(kept) < expected_count:
+    if len(kept) < expected_count and required:
         raise RuntimeError(
-            f"Could only recover {len(kept)}/{expected_count} ROI rectangles for color {color.tolist()} from preview. "
-            "Use the original PNG generated by annotate_rois.py, not a screenshot/JPEG."
+            f"Could only recover {len(kept)}/{expected_count} ROI rectangles for color {color.tolist()} from preview."
         )
-    # Keep the expected number of largest rectangle candidates. Text glyphs are much smaller.
     return kept[:expected_count]
 
 
@@ -106,20 +115,102 @@ def _center(rect: list[int]) -> tuple[float, float]:
     return x + w / 2.0, y + h / 2.0
 
 
-def _associate_detected_to_config(items: list[dict[str, object]], detected: list[list[int]]) -> dict[str, list[int]]:
-    # Preview and JSON were originally created together. Match by nearest center in template coordinates.
+def _orient_point(x: float, y: float, name: str, w: float, h: float) -> tuple[float, float]:
+    if name == "identity":
+        return x, y
+    if name == "hflip":
+        return w - x, y
+    if name == "vflip":
+        return x, h - y
+    if name == "rot180":
+        return w - x, h - y
+    raise ValueError(name)
+
+
+def _greedy_assignment(
+    items: list[dict[str, object]],
+    detected: list[list[int]],
+    *,
+    orientation: str,
+    source_w: int,
+    source_h: int,
+    template_w: int,
+    template_h: int,
+) -> tuple[dict[str, list[int]], float]:
+    if len(detected) < len(items):
+        raise ValueError("not enough detected rectangles")
+
     remaining = detected[:]
     result: dict[str, list[int]] = {}
-    for item in items:
+    total = 0.0
+    sx = template_w / max(1.0, float(source_w))
+    sy = template_h / max(1.0, float(source_h))
+
+    # Use the most spatially distinctive items first: farthest from image center.
+    def key(item: dict[str, object]) -> float:
+        cx, cy = _center([int(v) for v in item["roi"]])
+        ox, oy = _orient_point(cx, cy, orientation, source_w, source_h)
+        tx, ty = ox * sx, oy * sy
+        return (tx - template_w / 2.0) ** 2 + (ty - template_h / 2.0) ** 2
+
+    for item in sorted(items, key=key, reverse=True):
         roi = [int(v) for v in item["roi"]]
         cx, cy = _center(roi)
+        ox, oy = _orient_point(cx, cy, orientation, source_w, source_h)
+        tx, ty = ox * sx, oy * sy
         best_i = min(
             range(len(remaining)),
-            key=lambda i: (remaining[i][0] + remaining[i][2] / 2.0 - cx) ** 2
-            + (remaining[i][1] + remaining[i][3] / 2.0 - cy) ** 2,
+            key=lambda i: (_center(remaining[i])[0] - tx) ** 2 + (_center(remaining[i])[1] - ty) ** 2,
         )
-        result[str(item["id"])] = remaining.pop(best_i)
-    return result
+        rect = remaining.pop(best_i)
+        rx, ry = _center(rect)
+        total += (rx - tx) ** 2 + (ry - ty) ** 2
+        result[str(item["id"])] = rect
+    return result, total
+
+
+def _associate_ids_with_best_config_orientation(
+    s_items: list[dict[str, object]],
+    e_items: list[dict[str, object]],
+    detected_s: list[list[int]],
+    detected_e: list[list[int]],
+    *,
+    source_w: int,
+    source_h: int,
+    template_w: int,
+    template_h: int,
+) -> tuple[dict[str, list[int]], str, float]:
+    best_map: dict[str, list[int]] | None = None
+    best_orientation = "identity"
+    best_cost = float("inf")
+
+    for orientation in ("identity", "hflip", "vflip", "rot180"):
+        mapping: dict[str, list[int]] = {}
+        cost = 0.0
+        if s_items:
+            smap, scost = _greedy_assignment(
+                s_items, detected_s, orientation=orientation,
+                source_w=source_w, source_h=source_h,
+                template_w=template_w, template_h=template_h,
+            )
+            mapping.update(smap)
+            cost += scost
+        if e_items:
+            emap, ecost = _greedy_assignment(
+                e_items, detected_e, orientation=orientation,
+                source_w=source_w, source_h=source_h,
+                template_w=template_w, template_h=template_h,
+            )
+            mapping.update(emap)
+            cost += ecost
+        if cost < best_cost:
+            best_cost = cost
+            best_orientation = orientation
+            best_map = mapping
+
+    if best_map is None:
+        raise RuntimeError("Could not associate preview rectangles with S/E IDs")
+    return best_map, best_orientation, best_cost
 
 
 def _match_template_to_reference(template: np.ndarray, reference: np.ndarray) -> tuple[np.ndarray, str, int, int, float]:
@@ -205,18 +296,33 @@ def _draw_preview(reference: np.ndarray, config: dict[str, object]) -> np.ndarra
     return canvas
 
 
+def _draw_recovered_template(template: np.ndarray, mapping: dict[str, list[int]]) -> np.ndarray:
+    canvas = template.copy()
+    for roi_id, roi in mapping.items():
+        x, y, w, h = roi
+        color = (60, 210, 60) if roi_id.upper().startswith("S") else (0, 170, 255)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 4)
+        cv2.putText(canvas, roi_id, (x, max(28, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+    return canvas
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=(
-            "Use the known-good annotated brunei_preview.png as the ROI coordinate source, "
-            "match its underlying product image to the current canonical reference, and remap all ROIs."
+            "Use a known-good annotated *_preview.png as the S/E ROI template, match its product image "
+            "to the current canonical reference, and remap S/E ROIs. Spring overlays are optional."
         )
     )
-    p.add_argument("--template-preview", required=True, help="Known-good *_preview.png created by annotate_rois.py")
-    p.add_argument("--source-config", required=True, help="JSON that originally corresponds to that preview")
-    p.add_argument("--reference", required=True, help="Current canonical reference_aligned.png")
+    p.add_argument("--template-preview", required=True)
+    p.add_argument("--source-config", required=True)
+    p.add_argument("--reference", required=True)
     p.add_argument("--output-config", required=True)
     p.add_argument("--output-preview", required=True)
+    p.add_argument(
+        "--strict-springs",
+        action="store_true",
+        help="Fail if spring overlays cannot be recovered. Default: remap S/E only and omit springs when absent.",
+    )
     args = p.parse_args()
 
     template_path = Path(args.template_preview).resolve()
@@ -234,17 +340,31 @@ def main() -> None:
     e_items = [x for x in screw_items if str(x.get("id", "")).upper().startswith("E")]
     spring_items = [dict(x) for x in config.get("spring_regions", []) if bool(x.get("enabled", True))]
 
-    detected_s = _detect_preview_rectangles(template, COLOR_S, len(s_items))
-    detected_e = _detect_preview_rectangles(template, COLOR_E, len(e_items))
-    detected_p = _detect_preview_rectangles(template, COLOR_P, len(spring_items)) if spring_items else []
+    detected_s = _detect_preview_rectangles(template, COLOR_S, len(s_items), required=True)
+    detected_e = _detect_preview_rectangles(template, COLOR_E, len(e_items), required=True)
+    detected_p = _detect_preview_rectangles(
+        template,
+        COLOR_P,
+        len(spring_items),
+        required=bool(args.strict_springs),
+    ) if spring_items else []
 
-    template_rois: dict[str, list[int]] = {}
-    template_rois.update(_associate_detected_to_config(s_items, detected_s))
-    template_rois.update(_associate_detected_to_config(e_items, detected_e))
-    if spring_items:
-        template_rois.update(_associate_detected_to_config(spring_items, detected_p))
+    th, tw = template.shape[:2]
+    source_w = int(config.get("reference_width") or config.get("coordinate_system", {}).get("image_width") or tw)
+    source_h = int(config.get("reference_height") or config.get("coordinate_system", {}).get("image_height") or th)
 
-    H, orientation, matches, inliers, ratio = _match_template_to_reference(template, reference)
+    template_rois, id_orientation, id_cost = _associate_ids_with_best_config_orientation(
+        s_items,
+        e_items,
+        detected_s,
+        detected_e,
+        source_w=source_w,
+        source_h=source_h,
+        template_w=tw,
+        template_h=th,
+    )
+
+    H, image_orientation, matches, inliers, ratio = _match_template_to_reference(template, reference)
     rh, rw = reference.shape[:2]
 
     remapped = json.loads(json.dumps(config))
@@ -255,9 +375,10 @@ def main() -> None:
         "reference_image": str(reference_path),
         "image_width": rw,
         "image_height": rh,
-        "note": "ROIs remapped from the known-good annotated preview template.",
+        "note": "S/E ROIs remapped from the known-good annotated preview template.",
         "template_preview": str(template_path),
-        "template_orientation_selected": orientation,
+        "config_id_orientation_selected": id_orientation,
+        "template_image_orientation_selected": image_orientation,
         "template_feature_matches": matches,
         "template_feature_inliers": inliers,
         "template_feature_inlier_ratio": ratio,
@@ -267,25 +388,48 @@ def main() -> None:
         roi_id = str(item.get("id"))
         if roi_id in template_rois:
             item["roi"] = _transform_rect(template_rois[roi_id], H, rw, rh)
-    for item in remapped.get("spring_regions", []):
-        roi_id = str(item.get("id"))
-        if roi_id in template_rois:
-            item["roi"] = _transform_rect(template_rois[roi_id], H, rw, rh)
+
+    if spring_items and len(detected_p) >= len(spring_items):
+        # Only use spring overlays if they actually exist in this preview. Association is kept
+        # conservative because current work is S/E presence inspection.
+        spring_map, _ = _greedy_assignment(
+            spring_items,
+            detected_p,
+            orientation=id_orientation,
+            source_w=source_w,
+            source_h=source_h,
+            template_w=tw,
+            template_h=th,
+        )
+        for item in remapped.get("spring_regions", []):
+            roi_id = str(item.get("id"))
+            if roi_id in spring_map:
+                item["roi"] = _transform_rect(spring_map[roi_id], H, rw, rh)
+    elif spring_items:
+        # Do not silently keep known-wrong spring coordinates in a remapped config.
+        remapped["spring_regions"] = []
 
     output_config_path.parent.mkdir(parents=True, exist_ok=True)
     output_preview_path.parent.mkdir(parents=True, exist_ok=True)
     output_config_path.write_text(json.dumps(remapped, ensure_ascii=False, indent=2), encoding="utf-8")
     write_image(output_preview_path, _draw_preview(reference, remapped))
 
+    recovered_path = output_preview_path.with_name(output_preview_path.stem + "_template_recovered.png")
+    write_image(recovered_path, _draw_recovered_template(template, template_rois))
+
     print("=== ROI template remap complete ===")
     print(f"Template: {template_path}")
     print(f"Reference: {reference_path}")
-    print(f"Selected orientation: {orientation}")
-    print(f"SIFT matches/inliers: {matches}/{inliers} ({ratio:.1%})")
     print(f"Recovered template S/E/P: {len(detected_s)}/{len(detected_e)}/{len(detected_p)}")
+    if spring_items and len(detected_p) < len(spring_items):
+        print(f"WARNING: spring overlays not present/recoverable ({len(detected_p)}/{len(spring_items)}); spring_regions omitted from output.")
+    print(f"Config-ID orientation vs template: {id_orientation} (cost={id_cost:.1f})")
+    print(f"Template-image orientation vs reference: {image_orientation}")
+    print(f"SIFT matches/inliers: {matches}/{inliers} ({ratio:.1%})")
+    print(f"Recovered-template debug: {recovered_path}")
     print(f"Output config: {output_config_path}")
     print(f"Output preview: {output_preview_path}")
-    print("IMPORTANT: visually inspect the output preview before rebuilding any model.")
+    print("IMPORTANT: first inspect *_template_recovered.png; then inspect output preview. Do not rebuild a model until both are correct.")
 
 
 if __name__ == "__main__":
