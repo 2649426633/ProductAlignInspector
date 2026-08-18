@@ -138,6 +138,61 @@ def leave_one_out_scores(bank: np.ndarray, k_neighbors: int = 3) -> np.ndarray:
     return np.mean(distances, axis=1).astype(np.float32)
 
 
+def robust_bank_mask(
+    bank: np.ndarray,
+    *,
+    k_neighbors: int = 3,
+    outlier_quantile: float = 0.95,
+    mad_scale: float = 5.0,
+    min_keep_ratio: float = 0.85,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Identify gross GOOD-bank outliers before threshold calibration.
+
+    A single badly aligned/abnormal GOOD crop must not be allowed to inflate the
+    production threshold. We combine a high quantile with a robust MAD bound and
+    never remove more than a small fraction of the bank.
+    """
+    memory = np.asarray(bank, dtype=np.float32)
+    scores = leave_one_out_scores(memory, k_neighbors=k_neighbors)
+    if not 0.5 <= outlier_quantile < 1.0:
+        raise ValueError("outlier_quantile must be in [0.5, 1.0)")
+    if mad_scale <= 0:
+        raise ValueError("mad_scale must be > 0")
+    if not 0.5 <= min_keep_ratio <= 1.0:
+        raise ValueError("min_keep_ratio must be in [0.5, 1.0]")
+
+    median = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - median)))
+    robust_sigma = 1.4826 * mad
+    q_limit = float(np.quantile(scores, outlier_quantile))
+    mad_limit = median + float(mad_scale) * robust_sigma
+    cutoff = max(q_limit, mad_limit)
+    mask = scores <= cutoff
+
+    min_keep = max(8, int(np.ceil(memory.shape[0] * float(min_keep_ratio))))
+    min_keep = min(min_keep, memory.shape[0])
+    if int(mask.sum()) < min_keep:
+        order = np.argsort(scores)
+        mask = np.zeros(scores.shape[0], dtype=bool)
+        mask[order[:min_keep]] = True
+        cutoff = float(scores[order[min_keep - 1]])
+
+    stats = {
+        "raw_count": float(memory.shape[0]),
+        "kept_count": float(mask.sum()),
+        "removed_count": float(memory.shape[0] - int(mask.sum())),
+        "score_median": median,
+        "score_mad": mad,
+        "robust_sigma": float(robust_sigma),
+        "outlier_quantile": float(outlier_quantile),
+        "quantile_limit": q_limit,
+        "mad_scale": float(mad_scale),
+        "mad_limit": float(mad_limit),
+        "cutoff": float(cutoff),
+    }
+    return mask, scores, stats
+
+
 def calibrate_threshold(
     bank: np.ndarray,
     *,
@@ -152,7 +207,11 @@ def calibrate_threshold(
     scores = leave_one_out_scores(bank, k_neighbors=k_neighbors)
     q_value = float(np.quantile(scores, quantile))
     max_value = float(np.max(scores))
-    threshold = max(q_value * float(margin), max_value * 1.02, 1e-6)
+
+    # Deliberately do NOT force threshold >= max training score. A single unusual
+    # GOOD sample used to make E01/E04/E05/E09 thresholds explode and hide defects.
+    # The bank is robust-filtered first; threshold then follows the normal bulk.
+    threshold = max(q_value * float(margin), 1e-6)
     stats = {
         "count": float(scores.size),
         "min": float(np.min(scores)),
