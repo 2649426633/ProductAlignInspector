@@ -52,15 +52,19 @@ def _affine_h(matrix: np.ndarray) -> np.ndarray:
 
 
 def aligned_to_input_affine(alignment) -> np.ndarray:
+    """Map final aligned/reference coordinates back to the raw input image."""
     if alignment.feature_matrix is None:
         raise RuntimeError(
             f"Cannot map ROI to original image for alignment method {alignment.method}: feature_matrix unavailable"
         )
-    input_to_final = _affine_h(alignment.feature_matrix)
+    input_to_feature = _affine_h(alignment.feature_matrix)
+    input_to_final = input_to_feature
     if alignment.ecc_matrix is not None:
-        ecc_final_to_feature = _affine_h(alignment.ecc_matrix)
-        feature_to_final = np.linalg.inv(ecc_final_to_feature)
-        input_to_final = feature_to_final @ input_to_final
+        # findTransformECC returns final(template)->feature(moving). The actual
+        # refined image uses WARP_INVERSE_MAP, therefore feature->final = inv(W).
+        final_to_feature = _affine_h(alignment.ecc_matrix)
+        feature_to_final = np.linalg.inv(final_to_feature)
+        input_to_final = feature_to_final @ input_to_feature
     return np.linalg.inv(input_to_final)[:2, :].astype(np.float32)
 
 
@@ -68,6 +72,11 @@ def roi_polygon_in_input(roi: list[int] | tuple[int, int, int, int], final_to_in
     x, y, w, h = [int(v) for v in roi]
     corners = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]).reshape(-1, 1, 2)
     return np.round(cv2.transform(corners, final_to_input).reshape(-1, 2)).astype(np.int32)
+
+
+def roi_polygon_aligned(roi: list[int] | tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = [int(v) for v in roi]
+    return np.asarray([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.int32)
 
 
 def draw_polygon(canvas: np.ndarray, polygon: np.ndarray, label: str, status: str) -> None:
@@ -105,7 +114,7 @@ def draw_polygon(canvas: np.ndarray, polygon: np.ndarray, label: str, status: st
     )
 
 
-def draw_banner(canvas: np.ndarray, relative: str, scenario: str, final_status: str, ng_rois: list[str]) -> None:
+def draw_banner(canvas: np.ndarray, relative: str, scenario: str, final_status: str, ng_rois: list[str], prefix: str) -> None:
     if final_status == "PASS":
         color = (0, 150, 0)
     elif final_status == "NG":
@@ -114,7 +123,7 @@ def draw_banner(canvas: np.ndarray, relative: str, scenario: str, final_status: 
         color = (0, 180, 255)
     banner_h = max(82, int(round(canvas.shape[0] * 0.082)))
     cv2.rectangle(canvas, (0, 0), (canvas.shape[1], banner_h), color, -1)
-    text = f"ResNet18 GOOD-only | {scenario} | {relative} | FINAL: {final_status}"
+    text = f"{prefix} | {scenario} | {relative} | FINAL: {final_status}"
     if ng_rois:
         text += " | NG: " + ",".join(ng_rois)
     cv2.putText(
@@ -149,25 +158,55 @@ def load_group(model_root: Path, group: str) -> tuple[dict[str, object], list[di
     return manifest, entries
 
 
+def jitter_offsets(radius: int) -> list[tuple[int, int]]:
+    r = max(0, int(radius))
+    if r == 0:
+        return [(0, 0)]
+    return [
+        (0, 0),
+        (-r, 0),
+        (r, 0),
+        (0, -r),
+        (0, r),
+        (-r, -r),
+        (r, -r),
+        (-r, r),
+        (r, r),
+    ]
+
+
+def shifted_roi(roi: list[int], dx: int, dy: int, image_w: int, image_h: int) -> list[int] | None:
+    x, y, w, h = roi
+    candidate = [x + dx, y + dy, w, h]
+    return candidate if validate_roi(candidate, image_w, image_h) else None
+
+
 def write_gallery(output: Path, rows: list[dict[str, object]], scenarios: list[str]) -> Path:
     cards = []
     for row in rows:
-        overlay = str(row.get("overlay", ""))
-        if not overlay:
+        original_overlay = str(row.get("overlay_original", ""))
+        aligned_overlay = str(row.get("overlay_aligned", ""))
+        if not original_overlay and not aligned_overlay:
             continue
-        src = html.escape(overlay.replace("\\", "/"))
+        original_src = html.escape(original_overlay.replace("\\", "/"))
+        aligned_src = html.escape(aligned_overlay.replace("\\", "/"))
         relative = html.escape(str(row.get("relative_path", "")))
         scenario = html.escape(str(row.get("scenario", "")))
         status = html.escape(str(row.get("final_status", "")))
         ng = html.escape(str(row.get("ng_rois", "")))
+        images_html = ""
+        if original_src:
+            images_html += f'<div><b>ORIGINAL mapped ROIs</b><a href="{original_src}" target="_blank"><img loading="lazy" src="{original_src}"></a></div>'
+        if aligned_src:
+            images_html += f'<div><b>ALIGNED canonical ROIs</b><a href="{aligned_src}" target="_blank"><img loading="lazy" src="{aligned_src}"></a></div>'
         cards.append(
-            f'<article class="card"><a href="{src}" target="_blank"><img loading="lazy" src="{src}"></a>'
+            f'<article class="card"><div class="pair">{images_html}</div>'
             f'<div class="meta"><b>{relative}</b><br>Scenario: {scenario}<br>Status: {status}<br>NG ROIs: {ng or "-"}</div></article>'
         )
     scenario_text = ", ".join(html.escape(v) for v in scenarios) if scenarios else "all"
     page = f"""<!doctype html><html><head><meta charset='utf-8'><title>ResNet18 GOOD-only Review</title>
-<style>body{{font-family:Segoe UI,Arial;margin:18px;background:#f4f4f4}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:14px}}.card{{background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden}}.card img{{width:100%;display:block}}.meta{{padding:10px;line-height:1.45}}</style></head>
-<body><h1>ResNet18 GOOD-only S/E Review</h1><p>Scenario filter: {scenario_text}. Green/red polygons are model predictions mapped to the ORIGINAL image; they are not ground truth.</p><div class='grid'>{''.join(cards)}</div></body></html>"""
+<style>body{{font-family:Segoe UI,Arial;margin:18px;background:#f4f4f4}}.grid{{display:grid;grid-template-columns:1fr;gap:16px}}.card{{background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden}}.pair{{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px}}.pair img{{width:100%;display:block;margin-top:4px}}.meta{{padding:10px;line-height:1.45}}@media(max-width:1100px){{.pair{{grid-template-columns:1fr}}}}</style></head>
+<body><h1>ResNet18 GOOD-only S/E Review</h1><p>Scenario filter: {scenario_text}. Left is mapped to the ORIGINAL image; right is the exact ALIGNED image used for inference. If the right-hand boxes are wrong, the ROI config/alignment is wrong. If only the left-hand boxes are wrong, the inverse drawing transform is wrong.</p><div class='grid'>{''.join(cards)}</div></body></html>"""
     path = output / "index.html"
     path.write_text(page, encoding="utf-8")
     return path
@@ -175,7 +214,7 @@ def write_gallery(output: Path, rows: list[dict[str, object]], scenarios: list[s
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Evaluate the separate S/E GOOD-only ResNet18 normal models and draw every ROI on original images."
+        description="Evaluate the separate S/E GOOD-only ResNet18 normal models and draw every ROI on original/aligned images."
     )
     p.add_argument("--test-root", required=True)
     p.add_argument("--model-root", default="artifacts/resnet18_goodonly")
@@ -186,20 +225,30 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--foreground-threshold", type=int, default=238)
     p.add_argument("--threshold-scale", type=float, default=1.0)
+    p.add_argument(
+        "--local-jitter",
+        type=int,
+        default=4,
+        help="Test +/- this many aligned pixels around each fixed ROI and use the best normal match. 0 disables.",
+    )
     p.add_argument("--scenario", action="append", help="Optional scenario filter; may be repeated")
     args = p.parse_args()
 
     if args.threshold_scale <= 0:
         raise SystemExit("--threshold-scale must be > 0")
+    if args.local_jitter < 0:
+        raise SystemExit("--local-jitter must be >= 0")
 
     test_root = Path(args.test_root).resolve()
     model_root = Path(args.model_root).resolve()
     reference_path = Path(args.reference).resolve()
     weights_path = Path(args.weights).resolve()
     output = Path(args.output).resolve()
-    overlays_root = output / "overlays_original"
+    overlays_original_root = output / "overlays_original"
+    overlays_aligned_root = output / "overlays_aligned"
     output.mkdir(parents=True, exist_ok=True)
-    overlays_root.mkdir(parents=True, exist_ok=True)
+    overlays_original_root.mkdir(parents=True, exist_ok=True)
+    overlays_aligned_root.mkdir(parents=True, exist_ok=True)
 
     reference = read_image(reference_path)
     s_manifest, s_entries = load_group(model_root, "S")
@@ -235,11 +284,13 @@ def main() -> None:
     if not selected:
         raise SystemExit("No test images selected")
 
+    offsets = jitter_offsets(args.local_jitter)
     print("=== ResNet18 GOOD-only S/E Evaluation ===")
     print(f"Device: {device}")
     print(f"Images: {len(selected)}")
     print(f"S ROIs: {[e['id'] for e in s_entries]}")
     print(f"E ROIs: {[e['id'] for e in e_entries]}")
+    print(f"Local ROI jitter: +/-{args.local_jitter}px ({len(offsets)} candidates/ROI)")
     print("All S and E ROIs are evaluated and drawn.")
 
     image_rows: list[dict[str, object]] = []
@@ -253,28 +304,42 @@ def main() -> None:
             aligned = alignment.aligned
             h, w = aligned.shape[:2]
 
-            crops = []
-            valid_entries = []
+            all_crops: list[np.ndarray] = []
+            candidate_ranges: list[tuple[int, int, list[tuple[int, int]]]] = []
             for entry in entries:
                 roi = [int(v) for v in entry["roi"]]
                 if not validate_roi(roi, w, h):
                     raise RuntimeError(f"invalid ROI {entry['id']}: {roi}")
-                crops.append(crop_roi(aligned, roi))
-                valid_entries.append(entry)
+                start = len(all_crops)
+                valid_offsets: list[tuple[int, int]] = []
+                for dx, dy in offsets:
+                    candidate_roi = shifted_roi(roi, dx, dy, w, h)
+                    if candidate_roi is None:
+                        continue
+                    all_crops.append(crop_roi(aligned, candidate_roi))
+                    valid_offsets.append((dx, dy))
+                end = len(all_crops)
+                if end == start:
+                    raise RuntimeError(f"no valid jitter candidates for ROI {entry['id']}")
+                candidate_ranges.append((start, end, valid_offsets))
 
-            features = extract_features(
+            all_features = extract_features(
                 model,
-                crops,
+                all_crops,
                 device=device,
                 input_size=input_size,
                 batch_size=args.batch_size,
             )
 
-            canvas = raw.copy()
+            canvas_original = raw.copy()
+            canvas_aligned = aligned.copy()
             ng_rois: list[str] = []
-            for feature, entry in zip(features, valid_entries):
+            for entry, (start, end, valid_offsets) in zip(entries, candidate_ranges):
                 bank = entry["bank"]
-                score = float(score_features(feature, bank, k_neighbors=k_neighbors)[0])
+                candidate_scores = score_features(all_features[start:end], bank, k_neighbors=k_neighbors)
+                best_index = int(np.argmin(candidate_scores))
+                score = float(candidate_scores[best_index])
+                best_dx, best_dy = valid_offsets[best_index]
                 base_threshold = float(entry["threshold"])
                 threshold = base_threshold * float(args.threshold_scale)
                 status = "PASS" if score <= threshold else "NG"
@@ -282,8 +347,12 @@ def main() -> None:
                 group = str(entry["group"])
                 if status == "NG":
                     ng_rois.append(roi_id)
-                polygon = roi_polygon_in_input(entry["roi"], final_to_input)
-                draw_polygon(canvas, polygon, f"{roi_id} {status} {score:.3f}/{threshold:.3f}", status)
+
+                base_roi = [int(v) for v in entry["roi"]]
+                label = f"{roi_id} {status} {score:.3f}/{threshold:.3f} d=({best_dx},{best_dy})"
+                draw_polygon(canvas_original, roi_polygon_in_input(base_roi, final_to_input), label, status)
+                draw_polygon(canvas_aligned, roi_polygon_aligned(base_roi), label, status)
+
                 roi_rows.append(
                     {
                         "relative_path": relative.as_posix(),
@@ -294,15 +363,23 @@ def main() -> None:
                         "score": score,
                         "threshold": threshold,
                         "status": status,
+                        "best_offset_x": best_dx,
+                        "best_offset_y": best_dy,
                     }
                 )
 
             final_status = "NG" if ng_rois else "PASS"
-            draw_banner(canvas, relative.as_posix(), scenario, final_status, ng_rois)
-            overlay_rel = Path("overlays_original") / relative.with_suffix(".jpg")
-            overlay_path = output / overlay_rel
-            overlay_path.parent.mkdir(parents=True, exist_ok=True)
-            write_image(overlay_path, canvas)
+            draw_banner(canvas_original, relative.as_posix(), scenario, final_status, ng_rois, "ORIGINAL mapped")
+            draw_banner(canvas_aligned, relative.as_posix(), scenario, final_status, ng_rois, "ALIGNED inference")
+
+            original_rel = Path("overlays_original") / relative.with_suffix(".jpg")
+            aligned_rel = Path("overlays_aligned") / relative.with_suffix(".jpg")
+            original_path = output / original_rel
+            aligned_path = output / aligned_rel
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            aligned_path.parent.mkdir(parents=True, exist_ok=True)
+            write_image(original_path, canvas_original)
+            write_image(aligned_path, canvas_aligned)
 
             image_rows.append(
                 {
@@ -313,11 +390,17 @@ def main() -> None:
                     "alignment_method": alignment.method,
                     "feature_inlier_ratio": alignment.feature_inlier_ratio,
                     "ecc_score": "" if alignment.ecc_score is None else alignment.ecc_score,
-                    "overlay": overlay_rel.as_posix(),
+                    "overlay_original": original_rel.as_posix(),
+                    "overlay_aligned": aligned_rel.as_posix(),
                     "error": "",
                 }
             )
-            print(f"[{index}/{len(selected)}] {relative.as_posix()} -> {final_status} | NG={ng_rois or '-'}")
+            ecc_text = "-" if alignment.ecc_score is None else f"{alignment.ecc_score:.4f}"
+            print(
+                f"[{index}/{len(selected)}] {relative.as_posix()} -> {final_status} | "
+                f"NG={ng_rois or '-'} | align={alignment.method} "
+                f"inlier={alignment.feature_inlier_ratio:.1%} ecc={ecc_text}"
+            )
         except Exception as exc:
             image_rows.append(
                 {
@@ -328,7 +411,8 @@ def main() -> None:
                     "alignment_method": "",
                     "feature_inlier_ratio": "",
                     "ecc_score": "",
-                    "overlay": "",
+                    "overlay_original": "",
+                    "overlay_aligned": "",
                     "error": str(exc),
                 }
             )
@@ -346,7 +430,8 @@ def main() -> None:
                 "alignment_method",
                 "feature_inlier_ratio",
                 "ecc_score",
-                "overlay",
+                "overlay_original",
+                "overlay_aligned",
                 "error",
             ],
         )
@@ -366,6 +451,8 @@ def main() -> None:
                 "score",
                 "threshold",
                 "status",
+                "best_offset_x",
+                "best_offset_y",
             ],
         )
         writer.writeheader()
@@ -380,7 +467,8 @@ def main() -> None:
         "images": len(image_rows),
         "counts": counts,
         "threshold_scale": float(args.threshold_scale),
-        "note": "Folder scenario is not exact per-ROI ground truth; these are model predictions for manual review.",
+        "local_jitter": int(args.local_jitter),
+        "note": "Folder scenario is not exact per-ROI ground truth; compare aligned and original overlays to diagnose ROI geometry separately from model scoring.",
         "image_summary": str(image_csv),
         "roi_scores": str(roi_csv),
     }
@@ -391,6 +479,8 @@ def main() -> None:
     print("=== Evaluation complete ===")
     print(f"PASS/NG/RETRY: {counts['PASS']}/{counts['NG']}/{counts['RETRY']}")
     print(f"Gallery: {gallery}")
+    print(f"Aligned overlays: {overlays_aligned_root}")
+    print(f"Original overlays: {overlays_original_root}")
     print(f"ROI scores: {roi_csv}")
 
 
