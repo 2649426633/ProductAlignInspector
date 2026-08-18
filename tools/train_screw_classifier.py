@@ -18,11 +18,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from product_align_inspector.screw_classifier import (
+    DEFAULT_ARCHITECTURE,
     DEFAULT_CLASSES,
+    DEFAULT_RESNET18_WEIGHTS,
+    SUPPORTED_ARCHITECTURES,
     build_model,
     build_transforms,
     save_checkpoint,
     set_backbone_trainable,
+    split_model_parameters,
 )
 
 
@@ -244,7 +248,14 @@ def _evaluate(model, loader, criterion, device: torch.device, num_classes: int):
     return metrics, confusion
 
 
-def _make_optimizer(model: nn.Module, head_lr: float, backbone_lr: float, weight_decay: float, frozen: bool):
+def _make_optimizer(
+    model: nn.Module,
+    architecture: str,
+    head_lr: float,
+    backbone_lr: float,
+    weight_decay: float,
+    frozen: bool,
+):
     if frozen:
         return torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -252,19 +263,42 @@ def _make_optimizer(model: nn.Module, head_lr: float, backbone_lr: float, weight
             weight_decay=weight_decay,
         )
 
+    backbone_params, head_params = split_model_parameters(model, architecture)
     return torch.optim.AdamW(
         [
-            {"params": model.features.parameters(), "lr": backbone_lr},
-            {"params": model.classifier.parameters(), "lr": head_lr},
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": head_params, "lr": head_lr},
         ],
         weight_decay=weight_decay,
     )
+
+
+def _resolve_pretrained_weights(architecture: str, requested: str | None) -> Path | None:
+    if requested:
+        path = Path(requested)
+        return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+    if architecture == "resnet18":
+        return DEFAULT_RESNET18_WEIGHTS
+    return None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a small-sample screw/empty ROI classifier.")
     parser.add_argument("--dataset", default="artifacts/roi_dataset", help="ROI dataset directory")
     parser.add_argument("--output", default="artifacts/screw_classifier", help="Training output directory")
+    parser.add_argument(
+        "--architecture",
+        default=DEFAULT_ARCHITECTURE,
+        choices=list(SUPPORTED_ARCHITECTURES),
+        help="Classifier backbone. ResNet18 is the default for S/E presence models.",
+    )
+    parser.add_argument(
+        "--pretrained-weights",
+        help=(
+            "Local ImageNet backbone .pth. For ResNet18 the default is "
+            "weights/resnet18-f37072fd.pth under the repository root."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--freeze-epochs", type=int, default=5, help="Train classifier head only for first N epochs")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -277,7 +311,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0, help="Keep 0 on Windows unless you need more loader workers")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--no-pretrained", action="store_true", help="Do not use ImageNet pretrained weights")
+    parser.add_argument("--no-pretrained", action="store_true", help="Train without ImageNet initialization")
     args = parser.parse_args()
 
     if not 0.05 <= args.val_ratio <= 0.5:
@@ -302,7 +336,7 @@ def main() -> None:
     if not samples:
         raise SystemExit(
             f"No screw ROI samples found under {dataset_dir}. "
-            "Run tools\\extract_roi_dataset.py first."
+            "Build/extract a labeled empty/screw ROI dataset first."
         )
 
     total_counts = _class_counts(samples, class_names)
@@ -319,13 +353,19 @@ def main() -> None:
 
     train_counts = _class_counts(train_samples, class_names)
     val_counts = _class_counts(val_samples, class_names)
+    pretrained_weights = _resolve_pretrained_weights(args.architecture, args.pretrained_weights)
 
     print(f"Device: {device}")
+    print(f"Architecture: {args.architecture}")
     print(f"Classes: {class_names}")
     print(f"All samples: {len(samples)} {total_counts}")
     print(f"Train: {len(train_samples)} {train_counts}")
     print(f"Val: {len(val_samples)} {val_counts}")
     print(f"Split: {split_method}")
+    if args.no_pretrained:
+        print("Pretrained: disabled")
+    else:
+        print(f"Pretrained weights: {pretrained_weights or 'torchvision default'}")
     if split_method != "grouped_by_source":
         print("WARNING: validation is not source-isolated; accuracy may look better than real production accuracy.")
     if min(total_counts.values()) < 10:
@@ -350,14 +390,26 @@ def main() -> None:
         pin_memory=pin_memory,
     )
 
+    if not args.no_pretrained and args.architecture == "resnet18":
+        assert pretrained_weights is not None
+        if not pretrained_weights.is_file():
+            raise SystemExit(
+                f"ResNet18 pretrained weights not found: {pretrained_weights}\n"
+                "Put resnet18-f37072fd.pth in the repository weights folder, "
+                "or pass --pretrained-weights <path>."
+            )
+
     try:
-        model = build_model(num_classes=len(class_names), pretrained=not args.no_pretrained)
+        model = build_model(
+            num_classes=len(class_names),
+            pretrained=not args.no_pretrained,
+            architecture=args.architecture,
+            pretrained_weights=pretrained_weights,
+        )
     except Exception as exc:
-        if args.no_pretrained:
-            raise
         raise RuntimeError(
-            "Could not load ImageNet pretrained MobileNetV3-Small weights. "
-            "Check internet/cache, or rerun with --no-pretrained (not recommended for very small datasets)."
+            f"Could not initialize {args.architecture}. "
+            "For ResNet18, verify the local official ImageNet .pth file."
         ) from exc
 
     model.to(device)
@@ -365,8 +417,15 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
 
     frozen = args.freeze_epochs > 0
-    set_backbone_trainable(model, not frozen)
-    optimizer = _make_optimizer(model, args.head_lr, args.backbone_lr, args.weight_decay, frozen=frozen)
+    set_backbone_trainable(model, not frozen, args.architecture)
+    optimizer = _make_optimizer(
+        model,
+        args.architecture,
+        args.head_lr,
+        args.backbone_lr,
+        args.weight_decay,
+        frozen=frozen,
+    )
 
     best_f1 = -1.0
     best_epoch = 0
@@ -376,16 +435,17 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         if frozen and epoch == args.freeze_epochs + 1:
-            set_backbone_trainable(model, True)
+            set_backbone_trainable(model, True, args.architecture)
             frozen = False
             optimizer = _make_optimizer(
                 model,
+                args.architecture,
                 args.head_lr * 0.6,
                 args.backbone_lr,
                 args.weight_decay,
                 frozen=False,
             )
-            print("Backbone unfrozen: fine-tuning all MobileNetV3 layers.")
+            print(f"Backbone unfrozen: fine-tuning all {args.architecture} layers.")
 
         model.train()
         running_loss = 0.0
@@ -447,12 +507,14 @@ def main() -> None:
                 class_names=class_names,
                 input_size=args.input_size,
                 metrics={k: float(v) for k, v in val_metrics.items()},
+                architecture=args.architecture,
                 extra={
                     "split_method": split_method,
                     "train_counts": train_counts,
                     "val_counts": val_counts,
                     "val_confusion": val_confusion,
                     "pretrained": not args.no_pretrained,
+                    "pretrained_weights": None if pretrained_weights is None else str(pretrained_weights),
                 },
             )
         else:
@@ -469,10 +531,12 @@ def main() -> None:
         writer.writerows(history)
 
     summary = {
-        "architecture": "mobilenet_v3_small",
+        "architecture": args.architecture,
         "classes": class_names,
         "input_size": args.input_size,
         "device": str(device),
+        "pretrained": not args.no_pretrained,
+        "pretrained_weights": None if pretrained_weights is None else str(pretrained_weights),
         "sample_counts": total_counts,
         "train_counts": train_counts,
         "val_counts": val_counts,
