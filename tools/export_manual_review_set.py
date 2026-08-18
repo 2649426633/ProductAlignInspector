@@ -58,19 +58,79 @@ def resolve_from_repo(text: str | None) -> Path | None:
     return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
 
 
-def draw_roi(canvas: np.ndarray, roi: tuple[int, int, int, int], label: str, status: str) -> None:
+def _affine_h(matrix: np.ndarray) -> np.ndarray:
+    m = np.asarray(matrix, dtype=np.float64)
+    if m.shape != (2, 3):
+        raise ValueError(f"Expected 2x3 affine matrix, got {m.shape}")
+    out = np.eye(3, dtype=np.float64)
+    out[:2, :] = m
+    return out
+
+
+def aligned_to_input_affine(alignment) -> np.ndarray:
+    """Return affine mapping from FINAL aligned/reference coordinates back to raw input coordinates.
+
+    Feature alignment stores input->reference in feature_matrix. When ECC is accepted,
+    OpenCV findTransformECC returns the final-template->feature-aligned warp that is
+    consumed with WARP_INVERSE_MAP. Therefore:
+
+        input -> final = inverse(ECC) * feature_matrix
+        final -> input = inverse(input -> final)
+
+    The current 101-image dataset uses SIFT/recovery feature paths. Foreground-only
+    fallback does not currently expose the crop/resize transform, so it is rejected
+    here instead of drawing a potentially wrong polygon on the original image.
+    """
+    if alignment.feature_matrix is None:
+        raise RuntimeError(
+            f"Cannot map ROIs back to original image for alignment method {alignment.method}: "
+            "feature_matrix is unavailable."
+        )
+
+    input_to_final = _affine_h(alignment.feature_matrix)
+    if alignment.ecc_matrix is not None:
+        ecc_final_to_feature = _affine_h(alignment.ecc_matrix)
+        feature_to_final = np.linalg.inv(ecc_final_to_feature)
+        input_to_final = feature_to_final @ input_to_final
+
+    final_to_input = np.linalg.inv(input_to_final)
+    return final_to_input[:2, :].astype(np.float32)
+
+
+def roi_polygon_in_input(
+    roi: tuple[int, int, int, int],
+    final_to_input: np.ndarray,
+) -> np.ndarray:
     x, y, w, h = roi
+    corners = np.float32(
+        [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+    ).reshape(-1, 1, 2)
+    mapped = cv2.transform(corners, final_to_input).reshape(-1, 2)
+    return np.round(mapped).astype(np.int32)
+
+
+def draw_polygon(
+    canvas: np.ndarray,
+    polygon: np.ndarray,
+    label: str,
+    status: str,
+) -> None:
     color = (0, 190, 0) if status == "PASS" else (0, 0, 255)
     thickness = max(3, int(round(min(canvas.shape[:2]) / 700)))
-    cv2.rectangle(canvas, (x, y), (x + w, y + h), color, thickness)
+    poly = np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(canvas, [poly], True, color, thickness, cv2.LINE_AA)
 
+    pts = poly.reshape(-1, 2)
+    anchor = pts[np.argmin(pts[:, 1])]
     font_scale = max(0.55, min(1.0, min(canvas.shape[:2]) / 1900.0))
     text_thickness = max(1, thickness - 1)
     (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness)
-    tx = max(0, min(x, canvas.shape[1] - tw - 10))
-    ty = y - 8
+    tx = int(np.clip(anchor[0], 0, max(0, canvas.shape[1] - tw - 10)))
+    ty = int(anchor[1]) - 8
     if ty - th - baseline - 4 < 0:
-        ty = min(canvas.shape[0] - 5, y + th + baseline + 12)
+        ty = min(canvas.shape[0] - 5, int(anchor[1]) + th + baseline + 12)
+    ty = int(np.clip(ty, th + baseline + 4, canvas.shape[0] - 5))
+
     cv2.rectangle(
         canvas,
         (tx, max(0, ty - th - baseline - 4)),
@@ -90,7 +150,13 @@ def draw_roi(canvas: np.ndarray, roi: tuple[int, int, int, int], label: str, sta
     )
 
 
-def draw_banner(canvas: np.ndarray, filename: str, final_status: str, ng_rois: list[str]) -> None:
+def draw_banner(
+    canvas: np.ndarray,
+    filename: str,
+    final_status: str,
+    ng_rois: list[str],
+    scenario: str,
+) -> None:
     if final_status == "PASS":
         color = (0, 150, 0)
     elif final_status == "NG":
@@ -98,24 +164,24 @@ def draw_banner(canvas: np.ndarray, filename: str, final_status: str, ng_rois: l
     else:
         color = (0, 180, 255)
 
-    banner_h = max(72, int(round(canvas.shape[0] * 0.075)))
+    banner_h = max(82, int(round(canvas.shape[0] * 0.082)))
     cv2.rectangle(canvas, (0, 0), (canvas.shape[1], banner_h), color, -1)
-    text = f"{filename}   FINAL: {final_status}"
+    text = f"MODEL PREDICTION | {scenario} | {filename} | FINAL: {final_status}"
     if ng_rois:
-        text += "   NG: " + ",".join(ng_rois)
+        text += " | NG: " + ",".join(ng_rois)
     cv2.putText(
         canvas,
         text,
         (20, int(banner_h * 0.68)),
         cv2.FONT_HERSHEY_SIMPLEX,
-        max(0.8, banner_h / 72.0),
+        max(0.72, banner_h / 82.0),
         (255, 255, 255),
-        max(2, int(round(banner_h / 34))),
+        max(2, int(round(banner_h / 38))),
         cv2.LINE_AA,
     )
 
 
-def write_gallery(output: Path, rows: list[dict[str, object]]) -> Path:
+def write_gallery(output: Path, rows: list[dict[str, object]], scenarios: list[str]) -> Path:
     cards: list[str] = []
     for row in rows:
         overlay_rel = str(row.get("overlay", ""))
@@ -123,29 +189,38 @@ def write_gallery(output: Path, rows: list[dict[str, object]]) -> Path:
             continue
         status = html.escape(str(row.get("final_status", "")))
         relative = html.escape(str(row.get("relative_path", "")))
+        scenario = html.escape(str(row.get("scenario", "")))
         ng_rois = html.escape(str(row.get("ng_rois", "")))
         src = html.escape(overlay_rel.replace("\\", "/"))
         cards.append(
-            f'<article class="card"><a href="{src}" target="_blank">'
+            f'<article class="card" data-scenario="{scenario}"><a href="{src}" target="_blank">'
             f'<img loading="lazy" src="{src}" alt="{relative}"></a>'
-            f'<div class="meta"><b>{relative}</b><br>Status: {status}<br>NG: {ng_rois or "-"}</div></article>'
+            f'<div class="meta"><b>{relative}</b><br>Scenario: {scenario}<br>'
+            f'Model status: {status}<br>Predicted NG ROIs: {ng_rois or "-"}</div></article>'
         )
 
+    scenario_text = ", ".join(html.escape(v) for v in scenarios) if scenarios else "all"
     page = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Manual Review</title>
+<html><head><meta charset="utf-8"><title>Original Image Manual Review</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:18px;background:#f4f4f4;color:#222}
-h1{margin:0 0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px}
+h1{margin:0 0 6px}.note{margin:0 0 16px;color:#555}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:14px}
 .card{background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px #0001}
 .card img{width:100%;display:block;background:#eee}.meta{padding:10px;line-height:1.45;font-size:14px}
-</style></head><body><h1>Manual Review Gallery</h1><div class="grid">""" + "\n".join(cards) + "</div></body></html>"
+</style></head><body>""" + (
+        f"<h1>Original Image Manual Review</h1>"
+        f"<p class='note'>Scenario filter: {scenario_text}. Red/green polygons are MODEL predictions mapped back to the ORIGINAL raw image; they are not manual ground truth.</p>"
+        f"<div class='grid'>{''.join(cards)}</div></body></html>"
+    )
     path = output / "index.html"
     path.write_text(page, encoding="utf-8")
     return path
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Generate marked review images for every test image.")
+    p = argparse.ArgumentParser(
+        description="Generate model-prediction ROI annotations mapped back onto original test images."
+    )
     p.add_argument("--test-root", required=True)
     p.add_argument("--model-dir", default="artifacts/roi_dino_full")
     p.add_argument("--reference")
@@ -154,6 +229,11 @@ def main() -> None:
     p.add_argument("--device", default="auto")
     p.add_argument("--decision-rules", default="configs/brunei_decision_rules.json")
     p.add_argument("--threshold-scale", type=float, default=1.0)
+    p.add_argument(
+        "--scenario",
+        action="append",
+        help="Only export this dataset scenario/category. May be supplied multiple times.",
+    )
     p.add_argument("--output", default="artifacts/manual_review")
     args = p.parse_args()
 
@@ -163,13 +243,25 @@ def main() -> None:
     test_root = Path(args.test_root).resolve()
     model_dir = Path(args.model_dir).resolve()
     output = Path(args.output).resolve()
-    overlays_root = output / "overlays"
+    overlays_root = output / "overlays_original"
     output.mkdir(parents=True, exist_ok=True)
     overlays_root.mkdir(parents=True, exist_ok=True)
 
-    images = collect_images(test_root)
+    all_images = collect_images(test_root)
+    scenario_filters = {str(v).strip().lower() for v in (args.scenario or []) if str(v).strip()}
+    images: list[Path] = []
+    for image_path in all_images:
+        relative = image_path.relative_to(test_root)
+        scenario = scenario_of(relative)
+        if scenario_filters and scenario.lower() not in scenario_filters:
+            continue
+        images.append(image_path)
+
     if not images:
-        raise SystemExit(f"No test images found: {test_root}")
+        available = sorted({scenario_of(p.relative_to(test_root)) for p in all_images})
+        raise SystemExit(
+            f"No test images matched. Requested={sorted(scenario_filters)}; available={available}"
+        )
 
     manifest = read_model_manifest(model_dir)
     reference_path = Path(args.reference or manifest["reference_image"]).resolve()
@@ -197,12 +289,15 @@ def main() -> None:
     dino = DINOv2Adapter(device=args.device, config=dino_cfg, project_root=REPO_ROOT)
     dino.load()
 
-    print("=== Manual Review Export ===", flush=True)
+    selected_scenarios = sorted({scenario_of(p.relative_to(test_root)) for p in images})
+    print("=== Original Image Manual Review Export ===", flush=True)
     print(f"Images:        {len(images)}", flush=True)
+    print(f"Scenarios:     {selected_scenarios}", flush=True)
     print(f"Decision ROIs: {[m.roi_id for m in models]}", flush=True)
     print(f"Rules:         {rules_path}", flush=True)
     print(f"Output:        {output}", flush=True)
-    print("Green=PASS, Red=NG. Label ratio is score/decision-threshold.", flush=True)
+    print("Inference is done on aligned fixed ROIs; annotations are inverse-mapped to ORIGINAL images.", flush=True)
+    print("Green=predicted PASS, Red=predicted NG. Ratio=score/decision-threshold.", flush=True)
     print("", flush=True)
 
     rows: list[dict[str, object]] = []
@@ -218,6 +313,7 @@ def main() -> None:
         row: dict[str, object] = {
             "relative_path": str(relative).replace("\\", "/"),
             "scenario": scenario,
+            "annotation_space": "original_input",
             "final_status": "RETRY",
             "ng_rois": "",
             "ng_roi_count": 0,
@@ -230,6 +326,7 @@ def main() -> None:
         try:
             raw = read_image(image_path)
             alignment = align_to_reference(raw, reference, align_cfg)
+            final_to_input = aligned_to_input_affine(alignment)
             aligned = alignment.aligned
             h, w = aligned.shape[:2]
 
@@ -240,7 +337,7 @@ def main() -> None:
                 crops.append(crop_roi(aligned, model.roi))
 
             token_batch = dino.patch_tokens_batch(crops)
-            preview = aligned.copy()
+            preview = raw.copy()
             ng_rois: list[str] = []
 
             for model, tokens in zip(models, token_batch):
@@ -263,11 +360,13 @@ def main() -> None:
 
                 ratio = None if not decision_threshold else float(score / decision_threshold)
                 ratio_text = "-" if ratio is None else f"{ratio:.2f}x"
-                draw_roi(preview, model.roi, f"{model.roi_id} {status} {ratio_text}", status)
+                polygon = roi_polygon_in_input(model.roi, final_to_input)
+                draw_polygon(preview, polygon, f"{model.roi_id} {status} {ratio_text}", status)
 
                 roi_rows.append({
                     "relative_path": str(relative).replace("\\", "/"),
                     "scenario": scenario,
+                    "annotation_space": "original_input",
                     "roi_id": model.roi_id,
                     "group": group_of(model.roi_id),
                     "status": status,
@@ -276,10 +375,11 @@ def main() -> None:
                     "multiplier": float(multiplier),
                     "decision_threshold": decision_threshold,
                     "score_over_threshold": ratio,
+                    "original_polygon": json.dumps(polygon.tolist(), ensure_ascii=False),
                 })
 
             final_status = "NG" if ng_rois else "PASS"
-            draw_banner(preview, image_path.name, final_status, ng_rois)
+            draw_banner(preview, image_path.name, final_status, ng_rois, scenario)
             write_image(overlay_path, preview)
 
             row.update({
@@ -315,8 +415,10 @@ def main() -> None:
             writer.writerows(roi_rows)
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "annotation_space": "original_input",
         "images": len(rows),
+        "scenarios": selected_scenarios,
         "pass": sum(1 for row in rows if row["final_status"] == "PASS"),
         "ng": sum(1 for row in rows if row["final_status"] == "NG"),
         "retry": sum(1 for row in rows if row["final_status"] == "RETRY"),
@@ -327,15 +429,15 @@ def main() -> None:
     }
     summary_json = output / "review_summary.json"
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    gallery = write_gallery(output, rows)
+    gallery = write_gallery(output, rows, selected_scenarios)
 
     print("", flush=True)
-    print("=== Manual Review Ready ===", flush=True)
-    print(f"Marked images: {overlays_root}", flush=True)
-    print(f"Gallery:       {gallery}", flush=True)
-    print(f"Image CSV:     {summary_csv}", flush=True)
-    print(f"ROI CSV:       {roi_csv}", flush=True)
-    print(f"Summary JSON:  {summary_json}", flush=True)
+    print("=== Original-image Review Ready ===", flush=True)
+    print(f"Marked originals: {overlays_root}", flush=True)
+    print(f"Gallery:          {gallery}", flush=True)
+    print(f"Image CSV:        {summary_csv}", flush=True)
+    print(f"ROI CSV:          {roi_csv}", flush=True)
+    print(f"Summary JSON:     {summary_json}", flush=True)
 
 
 if __name__ == "__main__":
