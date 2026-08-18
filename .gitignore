@@ -14,3 +14,5 @@ outputs/
 third_party/dinov2/
 weights/*.pth
 weights/*.pt
+weight/*.pth
+weight/*.pt
