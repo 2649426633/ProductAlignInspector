@@ -17,7 +17,7 @@ SUPPORTED_ARCHITECTURES = ("resnet18", "mobilenet_v3_small")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESNET18_WEIGHTS = REPO_ROOT / "weights" / "resnet18-f37072fd.pth"
+DEFAULT_RESNET18_WEIGHTS = REPO_ROOT / "weight" / "resnet18-f37072fd.pth"
 
 
 class PadToSquare:
