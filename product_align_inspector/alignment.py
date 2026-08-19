@@ -15,30 +15,28 @@ class ProductLocatorConfig:
     min_component_area_ratio: float = 0.00002
     close_kernel_ratio: float = 0.006
 
-    # RAW -> canonical reference registration. estimateAffinePartial2D is limited
-    # to one uniform scale + rotation + X/Y translation. No shear/perspective.
+    # SIFT is used only to obtain robust correspondences / a RANSAC inlier set.
+    # The FINAL geometry is rigid: rotation + X/Y translation, scale exactly 1.
     feature_max_dim: int = 1800
     feature_nfeatures: int = 6000
     feature_ratio_test: float = 0.72
     feature_min_matches: int = 16
     feature_min_inliers: int = 10
-    feature_min_inlier_ratio: float = 0.15
+    feature_min_inlier_ratio: float = 0.10
     feature_ransac_threshold_px: float = 5.0
-    feature_min_scale: float = 0.10
-    feature_max_scale: float = 2.00
 
-    # Optional production lock. After measuring the stable RAW->canonical scale,
-    # set this to a fixed value. Until then None accepts the measured coordinate scale.
-    canonical_scale: float | None = None
-    canonical_scale_tolerance: float = 0.04
+    # Fixed-camera production invariant. Kept as a field for CLI/API compatibility.
+    # Only 1.0 is accepted in the rigid path.
+    canonical_scale: float | None = 1.0
+    canonical_scale_tolerance: float = 0.02
 
-    # Fine refinement can only change rotation + translation, never scale.
+    # Fine refinement is also rigid (cv2.MOTION_EUCLIDEAN).
     ecc_max_dim: int = 1600
     ecc_iterations: int = 120
     ecc_epsilon: float = 1e-5
     ecc_accept_score: float = 0.70
 
-    # Compatibility fields retained for older command-line tools.
+    # Compatibility fields retained for older tools/configuration code.
     geometry_max_dim: int = 1200
     candidate_max_dim: int = 700
     candidate_ambiguity_margin: float = 0.03
@@ -48,6 +46,8 @@ class ProductLocatorConfig:
     fallback_preview_max_dim: int = 900
     fallback_preview_ecc_iterations: int = 80
     fallback_full_ecc_iterations: int = 350
+    feature_min_scale: float = 1.0
+    feature_max_scale: float = 1.0
 
 
 @dataclass
@@ -73,12 +73,12 @@ class AlignmentResult:
     location: ProductLocation
     ecc_score: float | None
     ecc_matrix: np.ndarray | None
-    method: str = "sift_similarity+euclidean_ecc"
+    method: str = "sift_ransac_rigid+euclidean_ecc"
     feature_matches: int = 0
     feature_inliers: int = 0
     feature_inlier_ratio: float = 0.0
 
-    # Compatibility: feature_matrix is also the final RAW-input -> canonical matrix.
+    # Compatibility: feature_matrix is the final RAW-input -> canonical matrix.
     feature_matrix: np.ndarray | None = None
     input_to_reference: np.ndarray | None = None
     reference_to_input: np.ndarray | None = None
@@ -87,7 +87,7 @@ class AlignmentResult:
     rigid_rotation_deg: float | None = None
     rigid_translation_xy: tuple[float, float] | None = None
     candidate_score: float | None = None
-    canonical_scale: float | None = None
+    canonical_scale: float | None = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         input_to_reference = self.input_to_reference
@@ -102,15 +102,19 @@ class AlignmentResult:
             "feature_matrix": None if self.feature_matrix is None else self.feature_matrix.tolist(),
             "input_to_reference": None if input_to_reference is None else input_to_reference.tolist(),
             "reference_to_input": None if self.reference_to_input is None else self.reference_to_input.tolist(),
-            "fallback_rotation_deg": None if self.fallback_rotation_deg is None else float(self.fallback_rotation_deg),
+            "fallback_rotation_deg": None
+            if self.fallback_rotation_deg is None
+            else float(self.fallback_rotation_deg),
             "ecc_score": None if self.ecc_score is None else float(self.ecc_score),
             "ecc_matrix": None if self.ecc_matrix is None else self.ecc_matrix.tolist(),
-            "rigid_rotation_deg": None if self.rigid_rotation_deg is None else float(self.rigid_rotation_deg),
+            "rigid_rotation_deg": None
+            if self.rigid_rotation_deg is None
+            else float(self.rigid_rotation_deg),
             "rigid_translation_xy": None
             if self.rigid_translation_xy is None
             else [float(self.rigid_translation_xy[0]), float(self.rigid_translation_xy[1])],
             "candidate_score": None if self.candidate_score is None else float(self.candidate_score),
-            "canonical_scale": None if self.canonical_scale is None else float(self.canonical_scale),
+            "canonical_scale": 1.0,
             "aligned_shape": list(self.aligned.shape),
             "coarse_shape": list(self.coarse.shape),
         }
@@ -151,7 +155,9 @@ def _registration_image(image: np.ndarray) -> np.ndarray:
     gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
     magnitude = cv2.magnitude(gx, gy)
     magnitude = cv2.GaussianBlur(magnitude, (5, 5), 0)
-    return cv2.normalize(magnitude, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+    return cv2.normalize(
+        magnitude, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
 
 
 def _remove_border_components(mask: np.ndarray, cfg: ProductLocatorConfig) -> np.ndarray:
@@ -164,17 +170,27 @@ def _remove_border_components(mask: np.ndarray, cfg: ProductLocatorConfig) -> np
         x, y, cw, ch, area = stats[label]
         if area < min_area:
             continue
-        if x <= border_margin or y <= border_margin or x + cw >= w - border_margin or y + ch >= h - border_margin:
+        if (
+            x <= border_margin
+            or y <= border_margin
+            or x + cw >= w - border_margin
+            or y + ch >= h - border_margin
+        ):
             continue
         out[labels == label] = 255
     return out
 
 
-def build_foreground_mask(image: np.ndarray, cfg: ProductLocatorConfig | None = None) -> np.ndarray:
+def build_foreground_mask(
+    image: np.ndarray,
+    cfg: ProductLocatorConfig | None = None,
+) -> np.ndarray:
     cfg = cfg or ProductLocatorConfig()
     gray = cv2.GaussianBlur(_gray_uint8(image), (5, 5), 0)
     background_level = float(np.percentile(gray, 95.0))
-    dynamic_threshold = int(np.clip(background_level - float(cfg.background_margin), 40.0, 250.0))
+    dynamic_threshold = int(
+        np.clip(background_level - float(cfg.background_margin), 40.0, 250.0)
+    )
     threshold = min(int(cfg.foreground_threshold), dynamic_threshold)
     mask = np.where(gray < threshold, 255, 0).astype(np.uint8)
     mask = _remove_border_components(mask, cfg)
@@ -218,6 +234,7 @@ def _location_from_mask(mask: np.ndarray) -> ProductLocation:
     else:
         cx = x + w / 2.0
         cy = y + h / 2.0
+
     return ProductLocation(
         bbox_xywh=(int(x), int(y), int(w), int(h)),
         center_xy=(float(cx), float(cy)),
@@ -227,7 +244,10 @@ def _location_from_mask(mask: np.ndarray) -> ProductLocation:
     )
 
 
-def locate_product(image: np.ndarray, cfg: ProductLocatorConfig | None = None) -> ProductLocation:
+def locate_product(
+    image: np.ndarray,
+    cfg: ProductLocatorConfig | None = None,
+) -> ProductLocation:
     cfg = cfg or ProductLocatorConfig()
     return _location_from_mask(build_foreground_mask(image, cfg))
 
@@ -257,7 +277,7 @@ def _matrix_scale(matrix: np.ndarray) -> float:
     sx = float(np.hypot(m[0, 0], m[1, 0]))
     sy = float(np.hypot(m[0, 1], m[1, 1]))
     if abs(sx - sy) > 1e-3 * max(1.0, sx, sy):
-        raise RuntimeError("Non-uniform scale detected; refusing non-similarity transform.")
+        raise RuntimeError("Non-uniform scale detected; refusing non-rigid transform.")
     return (sx + sy) * 0.5
 
 
@@ -266,7 +286,36 @@ def _matrix_rotation_deg(matrix: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(m[1, 0], m[0, 0])))
 
 
-def _estimate_similarity(
+def _solve_rigid(src_xy: np.ndarray, dst_xy: np.ndarray) -> np.ndarray:
+    """Least-squares 2D rigid transform dst = R*src + t, with scale fixed at 1."""
+    src = np.asarray(src_xy, dtype=np.float64).reshape(-1, 2)
+    dst = np.asarray(dst_xy, dtype=np.float64).reshape(-1, 2)
+    if len(src) < 2 or len(src) != len(dst):
+        raise RuntimeError("Rigid solve needs at least two paired points.")
+
+    src_center = src.mean(axis=0)
+    dst_center = dst.mean(axis=0)
+    x = src - src_center
+    y = dst - dst_center
+    u, _, vt = np.linalg.svd(x.T @ y)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+
+    translation = dst_center - rotation @ src_center
+    matrix = np.zeros((2, 3), dtype=np.float32)
+    matrix[:, :2] = rotation.astype(np.float32)
+    matrix[:, 2] = translation.astype(np.float32)
+
+    scale = _matrix_scale(matrix)
+    orthogonality = abs(float(np.dot(matrix[:, 0], matrix[:, 1])))
+    if abs(scale - 1.0) > 1e-5 or orthogonality > 1e-5:
+        raise RuntimeError("Rigid solve produced non-rigid geometry.")
+    return matrix
+
+
+def _estimate_rigid_from_features(
     image: np.ndarray,
     reference: np.ndarray,
     cfg: ProductLocatorConfig,
@@ -276,7 +325,9 @@ def _estimate_similarity(
 
     sift = cv2.SIFT_create(nfeatures=max(500, int(cfg.feature_nfeatures)))
     moving_kp, moving_desc = sift.detectAndCompute(_feature_image(moving_small), None)
-    reference_kp, reference_desc = sift.detectAndCompute(_feature_image(reference_small), None)
+    reference_kp, reference_desc = sift.detectAndCompute(
+        _feature_image(reference_small), None
+    )
     if moving_desc is None or reference_desc is None:
         raise RuntimeError("SIFT descriptors not found.")
 
@@ -292,18 +343,33 @@ def _estimate_similarity(
             good.append(first)
 
     if len(good) < int(cfg.feature_min_matches):
-        raise RuntimeError(f"Alignment skipped: only {len(good)} reliable feature matches (< {cfg.feature_min_matches}).")
+        raise RuntimeError(
+            f"Alignment skipped: only {len(good)} reliable feature matches "
+            f"(< {cfg.feature_min_matches})."
+        )
 
-    src = np.float32([
-        [moving_kp[m.queryIdx].pt[0] / moving_scale, moving_kp[m.queryIdx].pt[1] / moving_scale]
-        for m in good
-    ]).reshape(-1, 1, 2)
-    dst = np.float32([
-        [reference_kp[m.trainIdx].pt[0] / reference_scale, reference_kp[m.trainIdx].pt[1] / reference_scale]
-        for m in good
-    ]).reshape(-1, 1, 2)
+    src = np.float32(
+        [
+            [
+                moving_kp[m.queryIdx].pt[0] / moving_scale,
+                moving_kp[m.queryIdx].pt[1] / moving_scale,
+            ]
+            for m in good
+        ]
+    ).reshape(-1, 1, 2)
+    dst = np.float32(
+        [
+            [
+                reference_kp[m.trainIdx].pt[0] / reference_scale,
+                reference_kp[m.trainIdx].pt[1] / reference_scale,
+            ]
+            for m in good
+        ]
+    ).reshape(-1, 1, 2)
 
-    matrix, inlier_mask = cv2.estimateAffinePartial2D(
+    # Similarity RANSAC is used ONLY to identify a robust correspondence set.
+    # Its estimated scale is never used in the final geometry.
+    _, inlier_mask = cv2.estimateAffinePartial2D(
         src,
         dst,
         method=cv2.RANSAC,
@@ -312,37 +378,33 @@ def _estimate_similarity(
         confidence=0.995,
         refineIters=20,
     )
-    if matrix is None or inlier_mask is None:
-        raise RuntimeError("Similarity transform estimation failed.")
+    if inlier_mask is None:
+        raise RuntimeError("RANSAC inlier estimation failed.")
 
-    inliers = int(np.count_nonzero(inlier_mask))
+    inlier_flags = inlier_mask.reshape(-1).astype(bool)
+    inliers = int(np.count_nonzero(inlier_flags))
     inlier_ratio = float(inliers / max(1, len(good)))
     if inliers < int(cfg.feature_min_inliers):
-        raise RuntimeError(f"Alignment skipped: {inliers} inliers (< {cfg.feature_min_inliers}).")
+        raise RuntimeError(
+            f"Alignment skipped: {inliers} inliers (< {cfg.feature_min_inliers})."
+        )
     if inlier_ratio < float(cfg.feature_min_inlier_ratio):
         raise RuntimeError(
-            f"Alignment skipped: inlier ratio {inlier_ratio:.3f} (< {cfg.feature_min_inlier_ratio:.3f})."
+            f"Alignment skipped: inlier ratio {inlier_ratio:.3f} "
+            f"(< {cfg.feature_min_inlier_ratio:.3f})."
         )
 
-    matrix = matrix.astype(np.float32)
-    scale = _matrix_scale(matrix)
-    if not float(cfg.feature_min_scale) <= scale <= float(cfg.feature_max_scale):
+    if cfg.canonical_scale is not None and abs(float(cfg.canonical_scale) - 1.0) > 1e-6:
         raise RuntimeError(
-            f"Alignment skipped: canonical scale {scale:.5f} outside "
-            f"[{cfg.feature_min_scale:.3f}, {cfg.feature_max_scale:.3f}]."
+            "Rigid production path requires canonical_scale=1.0. "
+            "Per-frame scale estimation is disabled."
         )
-    if cfg.canonical_scale is not None:
-        expected = float(cfg.canonical_scale)
-        if expected <= 0:
-            raise ValueError("canonical_scale must be > 0")
-        relative_error = abs(scale / expected - 1.0)
-        if relative_error > float(cfg.canonical_scale_tolerance):
-            raise RuntimeError(
-                f"Alignment skipped: canonical scale {scale:.5f} differs from locked "
-                f"scale {expected:.5f} by {relative_error:.1%}."
-            )
 
-    return matrix, len(good), inliers, inlier_ratio
+    rigid = _solve_rigid(
+        src.reshape(-1, 2)[inlier_flags],
+        dst.reshape(-1, 2)[inlier_flags],
+    )
+    return rigid, len(good), inliers, inlier_ratio
 
 
 def _ecc_refine(
@@ -354,7 +416,10 @@ def _ecc_refine(
 ) -> tuple[float, np.ndarray]:
     reference_small, scale = _resize_max(reference, int(cfg.ecc_max_dim))
     coarse_small, coarse_scale = _resize_max(coarse, int(cfg.ecc_max_dim))
-    if abs(scale - coarse_scale) > 1e-6 or reference_small.shape[:2] != coarse_small.shape[:2]:
+    if (
+        abs(scale - coarse_scale) > 1e-6
+        or reference_small.shape[:2] != coarse_small.shape[:2]
+    ):
         raise RuntimeError("Internal ECC size mismatch.")
 
     template = _registration_image(reference_small)
@@ -378,7 +443,9 @@ def _ecc_refine(
     except cv2.error as exc:
         raise RuntimeError(f"ECC refinement failed: {exc}") from exc
 
-    refine_small = cv2.invertAffineTransform(warp_template_to_moving).astype(np.float32)
+    refine_small = cv2.invertAffineTransform(
+        warp_template_to_moving
+    ).astype(np.float32)
     refine_full = refine_small.copy()
     refine_full[:, 2] /= max(scale, 1e-12)
     return float(score), refine_full
@@ -391,8 +458,13 @@ def coarse_align(
 ) -> tuple[np.ndarray, ProductLocation, np.ndarray]:
     cfg = cfg or ProductLocatorConfig()
     location = _diagnostic_location(image, cfg)
-    if target_size is not None and tuple(map(int, target_size)) != (image.shape[1], image.shape[0]):
-        raise RuntimeError("coarse_align cannot map to a different coordinate system without a reference image.")
+    if target_size is not None and tuple(map(int, target_size)) != (
+        image.shape[1],
+        image.shape[0],
+    ):
+        raise RuntimeError(
+            "coarse_align cannot map to a different coordinate system without a reference image."
+        )
     return image.copy(), location, location.mask
 
 
@@ -404,18 +476,29 @@ def align_to_reference(
     ecc_epsilon: float | None = None,
     motion: int = cv2.MOTION_EUCLIDEAN,
 ) -> AlignmentResult:
-    """Align a RAW camera image directly into the canonical detection template.
+    """Align RAW input directly into the canonical detection-template canvas.
 
-    Input/reference resolutions may differ. Geometry is restricted to one uniform
-    coordinate scale + rotation + X/Y translation. ECC then refines rotation and
-    translation only. No non-uniform resize, shear, or perspective is estimated.
+    The input/reference canvas sizes may differ, but the physical product pixel
+    scale is fixed. Per-frame geometry is therefore strictly:
+      - rotation
+      - X translation
+      - Y translation
+
+    SIFT/RANSAC supplies robust point correspondences only. The final transform
+    is re-solved with scale=1.0, then refined by Euclidean ECC. No scale, shear,
+    non-uniform resize, or perspective is permitted.
     """
     del motion
     cfg = cfg or ProductLocatorConfig()
     if image is None or reference is None or image.size == 0 or reference.size == 0:
         raise RuntimeError("Input/reference image is empty.")
 
-    coarse_matrix, matches, inliers, inlier_ratio = _estimate_similarity(image, reference, cfg)
+    coarse_matrix, matches, inliers, inlier_ratio = _estimate_rigid_from_features(
+        image, reference, cfg
+    )
+    if abs(_matrix_scale(coarse_matrix) - 1.0) > 1e-5:
+        raise RuntimeError("Coarse rigid invariant violated.")
+
     ref_h, ref_w = reference.shape[:2]
     border = (255, 255, 255) if image.ndim == 3 else 255
     coarse = cv2.warpAffine(
@@ -427,15 +510,23 @@ def align_to_reference(
         borderValue=border,
     )
 
-    ecc_score, refine = _ecc_refine(reference, coarse, cfg, ecc_iterations, ecc_epsilon)
+    ecc_score, refine = _ecc_refine(
+        reference, coarse, cfg, ecc_iterations, ecc_epsilon
+    )
     if ecc_score < float(cfg.ecc_accept_score):
-        raise RuntimeError(f"Alignment skipped: ECC={ecc_score:.4f} < {cfg.ecc_accept_score:.2f}.")
+        raise RuntimeError(
+            f"Alignment skipped: ECC={ecc_score:.4f} < {cfg.ecc_accept_score:.2f}."
+        )
 
     final_matrix = _compose_affine(refine, coarse_matrix)
-    coarse_scale = _matrix_scale(coarse_matrix)
     final_scale = _matrix_scale(final_matrix)
-    if abs(final_scale / coarse_scale - 1.0) > 1e-3:
-        raise RuntimeError("Alignment invariant violated: ECC changed canonical scale.")
+    orthogonality = abs(
+        float(np.dot(final_matrix[:, 0], final_matrix[:, 1]))
+    )
+    if abs(final_scale - 1.0) > 1e-3 or orthogonality > 1e-3:
+        raise RuntimeError(
+            "Alignment invariant violated: final transform is not rigid scale=1."
+        )
 
     aligned = cv2.warpAffine(
         image,
@@ -458,7 +549,7 @@ def align_to_reference(
         location=location,
         ecc_score=ecc_score,
         ecc_matrix=refine,
-        method="sift_similarity+euclidean_ecc",
+        method="sift_ransac_rigid+euclidean_ecc",
         feature_matches=matches,
         feature_inliers=inliers,
         feature_inlier_ratio=inlier_ratio,
@@ -468,7 +559,7 @@ def align_to_reference(
         rigid_rotation_deg=rotation,
         rigid_translation_xy=(tx, ty),
         candidate_score=inlier_ratio,
-        canonical_scale=final_scale,
+        canonical_scale=1.0,
     )
 
 
