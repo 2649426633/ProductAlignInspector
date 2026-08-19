@@ -15,19 +15,19 @@ class ProductLocatorConfig:
     close_kernel_ratio: float = 0.006
     crop_padding_ratio: float = 0.08
 
-    # Foreground/PCA is only a fallback. The PCA axis itself is usable for
-    # large rotations, but its direction has 180-degree ambiguity and may
-    # occasionally flip by 90 degrees on near-symmetric products. Runtime
-    # fallback therefore searches quadrant candidates against the reference.
+    # Fixed-camera geometry path. The foreground seed is always a similarity
+    # transform (uniform scale + rotation + translation), never an X/Y stretch.
     max_abs_coarse_rotation_deg: float = 90.0
     fallback_quadrant_search: bool = True
     fallback_preview_max_dim: int = 900
     fallback_preview_ecc_iterations: int = 80
     fallback_full_ecc_iterations: int = 350
+    foreground_scale_search: float = 0.025
+    foreground_scale_steps: int = 3
+    foreground_ecc_accept_score: float = 0.90
 
-    # Primary alignment: match the canonical reference directly against the
-    # full input image. This is robust to arbitrary X/Y position and avoids
-    # depending on the vignette/background segmentation.
+    # SIFT remains as a recovery path. estimateAffinePartial2D is also a
+    # similarity transform, so it cannot independently stretch X and Y.
     feature_max_dim: int = 1800
     feature_nfeatures: int = 5000
     feature_ratio_test: float = 0.72
@@ -35,12 +35,11 @@ class ProductLocatorConfig:
     feature_min_inliers: int = 8
     feature_min_inlier_ratio: float = 0.25
     feature_ransac_threshold_px: float = 5.0
-    feature_min_scale: float = 0.70
-    feature_max_scale: float = 1.30
+    feature_min_scale: float = 0.20
+    feature_max_scale: float = 2.00
 
-    # ECC is used as an independent whole-image quality gate. In particular,
-    # the foreground fallback is never accepted below this score.
-    ecc_accept_score: float = 0.75
+    # Whole-image quality gate for SIFT paths.
+    ecc_accept_score: float = 0.88
 
 
 @dataclass
@@ -119,12 +118,7 @@ def _remove_border_components(mask: np.ndarray, cfg: ProductLocatorConfig) -> np
 
 
 def build_foreground_mask(image: np.ndarray, cfg: ProductLocatorConfig | None = None) -> np.ndarray:
-    """Build a product foreground mask while suppressing dark vignette connected to image borders.
-
-    This remains useful for reference creation and diagnostics. Runtime alignment
-    prefers SIFT/affine matching against the full image so a product near a dark
-    vignette does not get deleted together with a border-connected component.
-    """
+    """Return the largest non-border foreground component."""
     cfg = cfg or ProductLocatorConfig()
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -137,8 +131,11 @@ def build_foreground_mask(image: np.ndarray, cfg: ProductLocatorConfig | None = 
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     dilate_k = _odd(max(3, k // 2))
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_k, dilate_k))
-    merged = cv2.dilate(mask, dilate_kernel, iterations=1)
+    merged = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_k, dilate_k)),
+        iterations=1,
+    )
 
     contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -191,32 +188,12 @@ def locate_product(image: np.ndarray, cfg: ProductLocatorConfig | None = None) -
     )
 
 
-def _rotate_about(
-    image: np.ndarray,
-    center: tuple[float, float],
-    angle_deg: float,
-    border_value: int = 255,
-) -> np.ndarray:
-    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    h, w = image.shape[:2]
-    border = (border_value, border_value, border_value) if image.ndim == 3 else border_value
-    return cv2.warpAffine(
-        image,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=border,
-    )
-
-
 def _rotate_about_bound(
     image: np.ndarray,
     center: tuple[float, float],
     angle_deg: float,
     border_value: int = 255,
 ) -> np.ndarray:
-    """Rotate without clipping a large diagonal product at the original canvas edges."""
     h, w = image.shape[:2]
     matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
     cos_value = abs(float(matrix[0, 0]))
@@ -251,6 +228,25 @@ def _crop_with_padding(
     return image[y0:y1, x0:x1].copy()
 
 
+def _resize_letterbox(image: np.ndarray, target_size: tuple[int, int], value: int = 255) -> np.ndarray:
+    """Uniformly resize into target_size without X/Y distortion."""
+    tw, th = target_size
+    h, w = image.shape[:2]
+    scale = min(float(tw) / max(1, w), float(th) / max(1, h))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    resized = cv2.resize(image, (nw, nh), interpolation=interpolation)
+    if image.ndim == 3:
+        canvas = np.full((th, tw, image.shape[2]), value, dtype=image.dtype)
+    else:
+        canvas = np.full((th, tw), value, dtype=image.dtype)
+    x0 = (tw - nw) // 2
+    y0 = (th - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
 def _foreground_candidate(
     image: np.ndarray,
     initial: ProductLocation,
@@ -258,6 +254,7 @@ def _foreground_candidate(
     rotation_deg: float,
     target_size: tuple[int, int] | None,
 ) -> np.ndarray:
+    """Legacy coarse helper used by reference creation; now preserves aspect ratio."""
     rotated = (
         _rotate_about_bound(image, initial.center_xy, rotation_deg)
         if abs(rotation_deg) > 1e-3
@@ -267,10 +264,8 @@ def _foreground_candidate(
     crop = _crop_with_padding(rotated, rotated_location.bbox_xywh, cfg.crop_padding_ratio)
     if crop.size == 0:
         raise RuntimeError("Foreground fallback produced an empty crop.")
-
     if target_size is not None:
-        interpolation = cv2.INTER_AREA if crop.shape[1] > target_size[0] else cv2.INTER_CUBIC
-        crop = cv2.resize(crop, target_size, interpolation=interpolation)
+        crop = _resize_letterbox(crop, target_size)
     return crop
 
 
@@ -279,16 +274,8 @@ def coarse_align(
     cfg: ProductLocatorConfig | None = None,
     target_size: tuple[int, int] | None = None,
 ) -> tuple[np.ndarray, ProductLocation, np.ndarray]:
-    """Foreground/PCA normalization used for reference creation and fallback seeding.
-
-    Unlike the old implementation, large PCA angles are not silently ignored.
-    The rotation is performed on an expanded canvas so a 40-60 degree product
-    is not clipped. Runtime alignment resolves PCA direction ambiguity against
-    the actual reference before accepting a fallback result.
-    """
     cfg = cfg or ProductLocatorConfig()
     initial = locate_product(image, cfg)
-
     limit = max(0.0, float(cfg.max_abs_coarse_rotation_deg))
     rotation = float(np.clip(-initial.angle_deg, -limit, limit)) if limit > 0.0 else 0.0
     crop = _foreground_candidate(image, initial, cfg, rotation, target_size)
@@ -299,6 +286,197 @@ def _ecc_ready(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     return cv2.normalize(gray, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+
+
+def _ecc_refine(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    iterations: int,
+    epsilon: float,
+    motion: int,
+) -> tuple[np.ndarray, float | None, np.ndarray | None]:
+    """ECC refinement. Runtime uses EUCLIDEAN to prevent shear/X-Y stretching."""
+    target_size = (reference.shape[1], reference.shape[0])
+    template = _ecc_ready(reference)
+    moving_gray = _ecc_ready(moving)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iterations, epsilon)
+    try:
+        score, warp = cv2.findTransformECC(template, moving_gray, warp, motion, criteria, None, 5)
+        refined = cv2.warpAffine(
+            moving,
+            warp,
+            target_size,
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+        return refined, float(score), warp
+    except cv2.error:
+        return moving.copy(), None, None
+
+
+def _oriented_size(mask: np.ndarray) -> tuple[float, float]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        raise RuntimeError("No contour for oriented-size estimate.")
+    contour = max(contours, key=cv2.contourArea)
+    (_cx, _cy), (rw, rh), _angle = cv2.minAreaRect(contour)
+    short = max(1.0, float(min(rw, rh)))
+    long = max(1.0, float(max(rw, rh)))
+    return short, long
+
+
+def _foreground_scale(source: ProductLocation, target: ProductLocation) -> float:
+    src_short, src_long = _oriented_size(source.mask)
+    dst_short, dst_long = _oriented_size(target.mask)
+    ratios = np.asarray([dst_short / src_short, dst_long / src_long], dtype=np.float64)
+    return float(np.sqrt(max(1e-12, ratios[0] * ratios[1])))
+
+
+def _similarity_matrix(
+    source_center: tuple[float, float],
+    target_center: tuple[float, float],
+    rotation_deg: float,
+    scale: float,
+) -> np.ndarray:
+    matrix = cv2.getRotationMatrix2D(source_center, rotation_deg, scale).astype(np.float32)
+    src = np.asarray([source_center[0], source_center[1], 1.0], dtype=np.float32)
+    mapped = matrix @ src
+    matrix[0, 2] += float(target_center[0]) - float(mapped[0])
+    matrix[1, 2] += float(target_center[1]) - float(mapped[1])
+    return matrix
+
+
+def _warp_similarity(
+    image: np.ndarray,
+    source: ProductLocation,
+    target: ProductLocation,
+    target_shape: tuple[int, ...],
+    rotation_deg: float,
+    scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    matrix = _similarity_matrix(source.center_xy, target.center_xy, rotation_deg, scale)
+    h, w = target_shape[:2]
+    warped = cv2.warpAffine(
+        image,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
+    return warped, matrix
+
+
+def _preview_pair(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    max_dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    h, w = reference.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(h, w))) if max_dim > 0 else 1.0
+    if scale >= 0.9999:
+        return reference, moving
+    size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    return (
+        cv2.resize(reference, size, interpolation=cv2.INTER_AREA),
+        cv2.resize(moving, size, interpolation=cv2.INTER_AREA),
+    )
+
+
+def _foreground_similarity_result(
+    image: np.ndarray,
+    reference: np.ndarray,
+    cfg: ProductLocatorConfig,
+    ecc_iterations: int,
+    ecc_epsilon: float,
+) -> AlignmentResult | None:
+    """Fixed-camera alignment using only rigid/similarity geometry."""
+    try:
+        source = locate_product(image, cfg)
+        target = locate_product(reference, cfg)
+        base_scale = _foreground_scale(source, target)
+    except (RuntimeError, cv2.error):
+        return None
+
+    base_rotation = float(target.angle_deg - source.angle_deg)
+    rotations = [base_rotation]
+    if cfg.fallback_quadrant_search:
+        rotations.extend(base_rotation + x for x in (90.0, 180.0, 270.0))
+
+    clean_rotations: list[float] = []
+    for angle in rotations:
+        normalized = float((angle + 180.0) % 360.0 - 180.0)
+        if not any(abs(normalized - old) < 1e-4 for old in clean_rotations):
+            clean_rotations.append(normalized)
+
+    spread = max(0.0, float(cfg.foreground_scale_search))
+    steps = max(1, int(cfg.foreground_scale_steps))
+    if steps == 1 or spread <= 1e-9:
+        multipliers = [1.0]
+    else:
+        multipliers = np.linspace(1.0 - spread, 1.0 + spread, steps).tolist()
+
+    candidates: list[tuple[float, float, float, np.ndarray, np.ndarray]] = []
+    preview_iterations = max(40, int(cfg.fallback_preview_ecc_iterations))
+    preview_epsilon = max(float(ecc_epsilon), 1e-5)
+
+    for rotation in clean_rotations:
+        for multiplier in multipliers:
+            scale = float(base_scale * multiplier)
+            coarse, seed_matrix = _warp_similarity(
+                image,
+                source,
+                target,
+                reference.shape,
+                rotation,
+                scale,
+            )
+            pr, pm = _preview_pair(reference, coarse, int(cfg.fallback_preview_max_dim))
+            _refined, score, _warp = _ecc_refine(
+                pr,
+                pm,
+                preview_iterations,
+                preview_epsilon,
+                cv2.MOTION_EUCLIDEAN,
+            )
+            candidates.append(((-1.0 if score is None else float(score)), rotation, scale, coarse, seed_matrix))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: row[0], reverse=True)
+
+    full_iterations = max(int(ecc_iterations), int(cfg.fallback_full_ecc_iterations))
+    best: tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+    for _preview_score, rotation, scale, coarse, seed_matrix in candidates[:4]:
+        refined, score, ecc_matrix = _ecc_refine(
+            reference,
+            coarse,
+            full_iterations,
+            ecc_epsilon,
+            cv2.MOTION_EUCLIDEAN,
+        )
+        if score is None or ecc_matrix is None:
+            continue
+        if best is None or float(score) > best[0]:
+            best = (float(score), rotation, scale, coarse, refined, seed_matrix, ecc_matrix)
+
+    if best is None or best[0] < float(cfg.foreground_ecc_accept_score):
+        return None
+
+    score, rotation, _scale, coarse, refined, seed_matrix, ecc_matrix = best
+    return AlignmentResult(
+        aligned=refined,
+        coarse=coarse,
+        foreground_mask=source.mask,
+        location=source,
+        ecc_score=score,
+        ecc_matrix=ecc_matrix,
+        method="foreground_similarity+ecc",
+        feature_matrix=seed_matrix,
+        fallback_rotation_deg=rotation,
+    )
 
 
 def _resize_for_features(image: np.ndarray, max_dim: int) -> tuple[np.ndarray, float]:
@@ -321,34 +499,26 @@ def _location_from_affine(
     reference_shape: tuple[int, ...],
     input_to_reference: np.ndarray,
 ) -> ProductLocation:
-    """Infer the product/reference footprint in the original input image."""
     ih, iw = image_shape[:2]
     rh, rw = reference_shape[:2]
-
     reference_to_input = cv2.invertAffineTransform(input_to_reference.astype(np.float64))
     ref_corners = np.float32(
         [[0.0, 0.0], [rw - 1.0, 0.0], [rw - 1.0, rh - 1.0], [0.0, rh - 1.0]]
     ).reshape(-1, 1, 2)
     input_corners = cv2.transform(ref_corners, reference_to_input.astype(np.float32)).reshape(-1, 2)
-
-    xs = input_corners[:, 0]
-    ys = input_corners[:, 1]
+    xs, ys = input_corners[:, 0], input_corners[:, 1]
     x0 = max(0, int(np.floor(xs.min())))
     y0 = max(0, int(np.floor(ys.min())))
     x1 = min(iw, int(np.ceil(xs.max())) + 1)
     y1 = min(ih, int(np.ceil(ys.max())) + 1)
-
     p0, p1 = input_corners[0], input_corners[1]
     angle = float(np.degrees(np.arctan2(float(p1[1] - p0[1]), float(p1[0] - p0[0]))))
     while angle >= 90.0:
         angle -= 180.0
     while angle < -90.0:
         angle += 180.0
-
     mask = np.zeros((ih, iw), dtype=np.uint8)
-    polygon = np.round(input_corners).astype(np.int32)
-    cv2.fillConvexPoly(mask, polygon, 255)
-
+    cv2.fillConvexPoly(mask, np.round(input_corners).astype(np.int32), 255)
     center = input_corners.mean(axis=0)
     area = float(abs(cv2.contourArea(input_corners.astype(np.float32))))
     return ProductLocation(
@@ -365,27 +535,19 @@ def _feature_align(
     reference: np.ndarray,
     cfg: ProductLocatorConfig,
 ) -> tuple[np.ndarray, ProductLocation, np.ndarray, int, int, float]:
-    """Align the full input image to the reference using SIFT + RANSAC affine."""
     if not hasattr(cv2, "SIFT_create"):
         raise RuntimeError("This OpenCV build does not provide SIFT.")
 
     ref_gray, ref_scale = _resize_for_features(reference, cfg.feature_max_dim)
     img_gray, img_scale = _resize_for_features(image, cfg.feature_max_dim)
-
-    sift = cv2.SIFT_create(
-        nfeatures=cfg.feature_nfeatures,
-        contrastThreshold=0.02,
-        edgeThreshold=12,
-    )
+    sift = cv2.SIFT_create(nfeatures=cfg.feature_nfeatures, contrastThreshold=0.02, edgeThreshold=12)
     ref_kp, ref_desc = sift.detectAndCompute(ref_gray, None)
     img_kp, img_desc = sift.detectAndCompute(img_gray, None)
-
     if ref_desc is None or img_desc is None or len(ref_kp) < 4 or len(img_kp) < 4:
         raise RuntimeError("Not enough SIFT features.")
 
     matcher = cv2.BFMatcher(cv2.NORM_L2)
     pairs = matcher.knnMatch(ref_desc, img_desc, k=2)
-
     good_matches = []
     for pair in pairs:
         if len(pair) < 2:
@@ -393,15 +555,11 @@ def _feature_align(
         m, n = pair
         if m.distance < cfg.feature_ratio_test * n.distance:
             good_matches.append(m)
-
     if len(good_matches) < cfg.feature_min_matches:
-        raise RuntimeError(
-            f"Not enough feature matches: {len(good_matches)} < {cfg.feature_min_matches}"
-        )
+        raise RuntimeError(f"Not enough feature matches: {len(good_matches)} < {cfg.feature_min_matches}")
 
     ref_points = np.float32([ref_kp[m.queryIdx].pt for m in good_matches]) / ref_scale
     img_points = np.float32([img_kp[m.trainIdx].pt for m in good_matches]) / img_scale
-
     matrix, inlier_mask = cv2.estimateAffinePartial2D(
         img_points,
         ref_points,
@@ -412,7 +570,7 @@ def _feature_align(
         refineIters=50,
     )
     if matrix is None or inlier_mask is None:
-        raise RuntimeError("RANSAC could not estimate product affine transform.")
+        raise RuntimeError("RANSAC could not estimate product similarity transform.")
 
     inliers = int(inlier_mask.ravel().sum())
     inlier_ratio = float(inliers / max(1, len(good_matches)))
@@ -445,164 +603,6 @@ def _feature_align(
     return aligned, location, matrix.astype(np.float32), len(good_matches), inliers, inlier_ratio
 
 
-def _ecc_refine(
-    reference: np.ndarray,
-    moving: np.ndarray,
-    iterations: int,
-    epsilon: float,
-    motion: int,
-) -> tuple[np.ndarray, float | None, np.ndarray | None]:
-    target_size = (reference.shape[1], reference.shape[0])
-    template = _ecc_ready(reference)
-    moving_gray = _ecc_ready(moving)
-    warp = np.eye(2, 3, dtype=np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iterations, epsilon)
-
-    try:
-        score, warp = cv2.findTransformECC(template, moving_gray, warp, motion, criteria, None, 5)
-        refined = cv2.warpAffine(
-            moving,
-            warp,
-            target_size,
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255),
-        )
-        return refined, float(score), warp
-    except cv2.error:
-        return moving.copy(), None, None
-
-
-def _preview_pair(
-    reference: np.ndarray,
-    moving: np.ndarray,
-    max_dim: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    h, w = reference.shape[:2]
-    scale = min(1.0, float(max_dim) / float(max(h, w))) if max_dim > 0 else 1.0
-    if scale >= 0.9999:
-        if moving.shape[:2] != reference.shape[:2]:
-            moving = cv2.resize(moving, (w, h), interpolation=cv2.INTER_AREA)
-        return reference, moving
-
-    size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-    return (
-        cv2.resize(reference, size, interpolation=cv2.INTER_AREA),
-        cv2.resize(moving, size, interpolation=cv2.INTER_AREA),
-    )
-
-
-def _foreground_fallback_result(
-    image: np.ndarray,
-    reference: np.ndarray,
-    cfg: ProductLocatorConfig,
-    ecc_iterations: int,
-    ecc_epsilon: float,
-    motion: int,
-) -> AlignmentResult:
-    """Resolve the PCA orientation ambiguity against the canonical reference.
-
-    The old fallback ignored PCA angles above 15 degrees and could return a
-    visibly diagonal image as a successful alignment. Here we normalize the
-    PCA axis, try quadrant alternatives, rank them with a small ECC preview,
-    and require full-resolution ECC confirmation before returning success.
-    """
-    initial = locate_product(image, cfg)
-    target_size = (reference.shape[1], reference.shape[0])
-    base_rotation = -float(initial.angle_deg)
-
-    raw_rotations = [base_rotation]
-    if cfg.fallback_quadrant_search:
-        raw_rotations.extend(base_rotation + offset for offset in (90.0, 180.0, 270.0))
-
-    rotations: list[float] = []
-    for raw in raw_rotations:
-        normalized = float((raw + 180.0) % 360.0 - 180.0)
-        if not any(abs(normalized - existing) < 1e-4 for existing in rotations):
-            rotations.append(normalized)
-
-    candidates: list[tuple[float, float, np.ndarray]] = []
-    preview_iterations = max(40, int(cfg.fallback_preview_ecc_iterations))
-    preview_epsilon = max(float(ecc_epsilon), 1e-5)
-
-    for rotation in rotations:
-        try:
-            coarse = _foreground_candidate(image, initial, cfg, rotation, target_size)
-            preview_ref, preview_moving = _preview_pair(
-                reference,
-                coarse,
-                int(cfg.fallback_preview_max_dim),
-            )
-            _, preview_score, _ = _ecc_refine(
-                preview_ref,
-                preview_moving,
-                preview_iterations,
-                preview_epsilon,
-                motion,
-            )
-        except (RuntimeError, cv2.error):
-            continue
-
-        score_for_sort = -1.0 if preview_score is None else float(preview_score)
-        candidates.append((score_for_sort, rotation, coarse))
-
-    if not candidates:
-        raise RuntimeError("Foreground fallback failed: no valid orientation candidates.")
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    full_iterations = max(int(ecc_iterations), int(cfg.fallback_full_ecc_iterations))
-    best_score: float | None = None
-    best_rotation: float | None = None
-
-    # Usually the preview picks the correct orientation immediately. Evaluate
-    # the best two first; only pay for the remaining candidates if neither one
-    # passes the production ECC quality gate.
-    groups = [candidates[:2], candidates[2:]]
-    for group in groups:
-        accepted: list[tuple[float, float, np.ndarray, np.ndarray, np.ndarray]] = []
-        for _, rotation, coarse in group:
-            refined, full_score, full_matrix = _ecc_refine(
-                reference,
-                coarse,
-                full_iterations,
-                ecc_epsilon,
-                motion,
-            )
-            if full_score is not None and (best_score is None or full_score > best_score):
-                best_score = float(full_score)
-                best_rotation = float(rotation)
-            if (
-                full_score is not None
-                and full_matrix is not None
-                and full_score >= cfg.ecc_accept_score
-            ):
-                accepted.append(
-                    (float(full_score), float(rotation), coarse, refined, full_matrix)
-                )
-
-        if accepted:
-            accepted.sort(key=lambda item: item[0], reverse=True)
-            full_score, rotation, coarse, refined, full_matrix = accepted[0]
-            return AlignmentResult(
-                aligned=refined,
-                coarse=coarse,
-                foreground_mask=initial.mask,
-                location=initial,
-                ecc_score=full_score,
-                ecc_matrix=full_matrix,
-                method="foreground_quadrant+ecc",
-                fallback_rotation_deg=rotation,
-            )
-
-    score_text = "none" if best_score is None else f"{best_score:.4f}"
-    rotation_text = "none" if best_rotation is None else f"{best_rotation:.2f} deg"
-    raise RuntimeError(
-        "Foreground fallback alignment rejected: "
-        f"best ECC={score_text} < {cfg.ecc_accept_score:.2f}, "
-        f"rotation={rotation_text}."
-    )
-
-
 def _feature_result(
     image: np.ndarray,
     reference: np.ndarray,
@@ -611,10 +611,8 @@ def _feature_result(
     ecc_accept: float,
     ecc_iterations: int,
     ecc_epsilon: float,
-    motion: int,
     require_ecc: bool,
 ) -> AlignmentResult | None:
-    """Run one SIFT preset and optionally require ECC to independently confirm it."""
     try:
         feature_aligned, location, feature_matrix, matches, inliers, inlier_ratio = _feature_align(
             image, reference, cfg
@@ -627,28 +625,20 @@ def _feature_result(
         feature_aligned,
         ecc_iterations,
         ecc_epsilon,
-        motion,
+        cv2.MOTION_EUCLIDEAN,
     )
-
     ecc_ok = ecc_score is not None and ecc_score >= ecc_accept
     if require_ecc and not ecc_ok:
         return None
-
-    if ecc_ok:
-        aligned = refined
-        method = f"{method_prefix}+ecc"
-    else:
-        aligned = feature_aligned
-        method = method_prefix
-        ecc_matrix = None
-
+    aligned = refined if ecc_ok else feature_aligned
+    method = f"{method_prefix}+ecc" if ecc_ok else method_prefix
     return AlignmentResult(
         aligned=aligned,
         coarse=feature_aligned,
         foreground_mask=location.mask,
         location=location,
         ecc_score=ecc_score,
-        ecc_matrix=ecc_matrix,
+        ecc_matrix=ecc_matrix if ecc_ok else None,
         method=method,
         feature_matches=matches,
         feature_inliers=inliers,
@@ -663,22 +653,29 @@ def align_to_reference(
     cfg: ProductLocatorConfig | None = None,
     ecc_iterations: int = 200,
     ecc_epsilon: float = 1e-6,
-    motion: int = cv2.MOTION_AFFINE,
+    motion: int = cv2.MOTION_EUCLIDEAN,
 ) -> AlignmentResult:
-    """Align an input image to the canonical product reference.
+    """Align a product to the canonical reference without geometric stretching.
 
-    Runtime order:
-      1. strict SIFT/RANSAC using the configured production limits;
-      2. staged detail/relaxed/ultra SIFT recovery, accepted only when ECC
-         independently confirms the whole-image alignment;
-      3. foreground/PCA quadrant recovery, also accepted only when full ECC
-         confirms the alignment.
+    Runtime order for the fixed-camera application:
+      1. foreground/PCA similarity seed + EUCLIDEAN ECC;
+      2. strict SIFT similarity + EUCLIDEAN ECC;
+      3. one relaxed SIFT similarity recovery + EUCLIDEAN ECC.
 
-    A failed foreground fallback now raises RuntimeError instead of returning a
-    visibly wrong crop as if it were a successful alignment. Batch tools catch
-    that exception and mark the image as failed, preventing bad ROI training data.
+    `motion` is kept for API compatibility, but runtime refinement is intentionally
+    constrained to EUCLIDEAN motion so fixed ROI geometry cannot be sheared.
     """
     cfg = cfg or ProductLocatorConfig()
+
+    foreground = _foreground_similarity_result(
+        image,
+        reference,
+        cfg,
+        ecc_iterations=max(300, ecc_iterations),
+        ecc_epsilon=ecc_epsilon,
+    )
+    if foreground is not None:
+        return foreground
 
     strict = _feature_result(
         image,
@@ -688,80 +685,36 @@ def align_to_reference(
         ecc_accept=cfg.ecc_accept_score,
         ecc_iterations=ecc_iterations,
         ecc_epsilon=ecc_epsilon,
-        motion=motion,
-        require_ecc=False,
+        require_ecc=True,
     )
     if strict is not None:
         return strict
 
-    recovery_presets = [
-        (
-            "recovery_detail",
-            replace(
-                cfg,
-                feature_max_dim=2600,
-                feature_nfeatures=8000,
-                feature_ratio_test=0.76,
-                feature_min_matches=10,
-                feature_min_inliers=8,
-                feature_min_inlier_ratio=0.20,
-                feature_ransac_threshold_px=6.0,
-            ),
-            0.80,
-        ),
-        (
-            "recovery_relaxed",
-            replace(
-                cfg,
-                feature_max_dim=3200,
-                feature_nfeatures=12000,
-                feature_ratio_test=0.80,
-                feature_min_matches=8,
-                feature_min_inliers=6,
-                feature_min_inlier_ratio=0.15,
-                feature_ransac_threshold_px=8.0,
-            ),
-            0.80,
-        ),
-        (
-            "recovery_ultra",
-            replace(
-                cfg,
-                feature_max_dim=3600,
-                feature_nfeatures=16000,
-                feature_ratio_test=0.82,
-                feature_min_matches=8,
-                feature_min_inliers=6,
-                feature_min_inlier_ratio=0.12,
-                feature_ransac_threshold_px=10.0,
-            ),
-            0.85,
-        ),
-    ]
-
-    recovery_iterations = max(300, ecc_iterations)
-    for name, recovery_cfg, ecc_accept in recovery_presets:
-        recovered = _feature_result(
-            image,
-            reference,
-            recovery_cfg,
-            method_prefix=name,
-            ecc_accept=ecc_accept,
-            ecc_iterations=recovery_iterations,
-            ecc_epsilon=ecc_epsilon,
-            motion=motion,
-            require_ecc=True,
-        )
-        if recovered is not None:
-            return recovered
-
-    return _foreground_fallback_result(
+    relaxed_cfg = replace(
+        cfg,
+        feature_max_dim=3200,
+        feature_nfeatures=12000,
+        feature_ratio_test=0.80,
+        feature_min_matches=8,
+        feature_min_inliers=6,
+        feature_min_inlier_ratio=0.12,
+        feature_ransac_threshold_px=8.0,
+    )
+    recovered = _feature_result(
         image,
         reference,
-        cfg,
-        ecc_iterations=recovery_iterations,
+        relaxed_cfg,
+        method_prefix="recovery_relaxed",
+        ecc_accept=max(0.90, cfg.ecc_accept_score),
+        ecc_iterations=max(300, ecc_iterations),
         ecc_epsilon=ecc_epsilon,
-        motion=motion,
+        require_ecc=True,
+    )
+    if recovered is not None:
+        return recovered
+
+    raise RuntimeError(
+        "Alignment failed: foreground similarity and SIFT similarity paths did not pass ECC quality gates."
     )
 
 
