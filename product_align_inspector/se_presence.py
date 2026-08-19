@@ -73,7 +73,6 @@ def nearest_cosine_distance(vector: np.ndarray, bank: np.ndarray) -> float:
     bank = np.asarray(bank, dtype=np.float32)
     if bank.ndim != 2 or bank.shape[1] != vector.shape[1] or bank.shape[0] == 0:
         raise ValueError(f"Invalid bank shape {bank.shape} for descriptor {vector.shape}")
-    # Both descriptors and saved banks are L2 normalized.
     similarity = bank @ vector[0]
     return float(1.0 - float(np.max(similarity)))
 
@@ -96,7 +95,6 @@ def threshold_from_good(
     values = np.asarray(distances, dtype=np.float32).reshape(-1)
     if values.size == 0:
         return 0.05
-    # GOOD-only threshold: cover the observed normal range with a modest margin.
     base = max(float(np.max(values)), float(values.mean() + 4.0 * values.std()))
     return max(0.005, base * float(margin_factor) + float(margin_abs))
 
@@ -117,6 +115,8 @@ class _BasePresenceDetector:
             raise ValueError(
                 f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}"
             )
+        canonical_size = self.model.get("canonical_size")
+        self.canonical_size = None if canonical_size is None else (int(canonical_size[0]), int(canonical_size[1]))
         descriptor_cfg = self.model.get("descriptor") or {}
         self.descriptor_cfg = PresenceDescriptorConfig(
             size=int(descriptor_cfg.get("size", 40)),
@@ -133,9 +133,14 @@ class _BasePresenceDetector:
 
     def inspect(self, canonical_bgr: np.ndarray, context: dict[str, Any]) -> DetectionResult:
         h, w = canonical_bgr.shape[:2]
+        if self.canonical_size is not None and self.canonical_size != (w, h):
+            raise RuntimeError(
+                f"{self.name}: model canonical size={self.canonical_size[0]}x{self.canonical_size[1]}, "
+                f"runtime={w}x{h}"
+            )
+
         slot_rows: list[dict[str, Any]] = []
         any_ng = False
-
         for slot in enabled_slots(self.config, expected=self.expected):
             slot_id = str(slot.get("id", ""))
             if slot_id not in self.banks or slot_id not in self.thresholds:
