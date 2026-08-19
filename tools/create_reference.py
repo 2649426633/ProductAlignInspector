@@ -1,55 +1,57 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
-# Allow direct execution such as:
-#   python tools\create_reference.py ...
-# without requiring an editable package install first.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from product_align_inspector.alignment import ProductLocatorConfig, build_foreground_mask, coarse_align
-from product_align_inspector.io_utils import read_image, write_image, write_json
+from product_align_inspector.io_utils import read_image, write_json
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create a canonical GOOD reference image.")
-    parser.add_argument("--input", required=True, help="GOOD product image")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create the fixed-camera RAW geometry reference. "
+            "No crop, resize, rotation, inpaint, or normalization is performed."
+        )
+    )
+    parser.add_argument("--input", required=True, help="One real RAW GOOD image")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--threshold", type=int, default=238, help="Foreground grayscale threshold")
     args = parser.parse_args()
 
-    out = Path(args.output)
+    source = Path(args.input).resolve()
+    out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
-    cfg = ProductLocatorConfig(foreground_threshold=args.threshold)
-    image = read_image(args.input)
-    aligned, location, _ = coarse_align(image, cfg)
-    aligned_mask = build_foreground_mask(aligned, cfg)
+    image = read_image(source)
+    suffix = source.suffix.lower() or ".bmp"
+    reference_path = out / f"reference_raw{suffix}"
 
-    write_image(out / "reference_aligned.png", aligned)
-    write_image(out / "reference_mask.png", aligned_mask)
+    # Byte-for-byte copy whenever possible: the canonical geometry reference is
+    # exactly one real camera frame.
+    shutil.copy2(source, reference_path)
+
     write_json(
         out / "reference_meta.json",
         {
-            "source": str(Path(args.input)),
-            "reference_shape": list(aligned.shape),
-            "locator": location.to_dict(),
-            "config": {
-                "foreground_threshold": cfg.foreground_threshold,
-                "border_margin_ratio": cfg.border_margin_ratio,
-                "min_component_area_ratio": cfg.min_component_area_ratio,
-                "close_kernel_ratio": cfg.close_kernel_ratio,
-                "crop_padding_ratio": cfg.crop_padding_ratio,
-            },
+            "source": str(source),
+            "reference": str(reference_path),
+            "reference_width": int(image.shape[1]),
+            "reference_height": int(image.shape[0]),
+            "geometry": "rigid",
+            "allowed_transform": ["rotation", "translation_x", "translation_y"],
+            "forbidden_transform": ["scale", "resize_x_y", "shear", "perspective"],
+            "note": "ROI coordinates must be annotated on this exact raw reference coordinate system.",
         },
     )
-    print(f"Reference created: {out / 'reference_aligned.png'}")
-    print(f"Reference size: {aligned.shape[1]} x {aligned.shape[0]}")
-    print(f"Detected angle: {location.angle_deg:.3f} deg")
+
+    print(f"RAW reference created: {reference_path}")
+    print(f"Reference size: {image.shape[1]} x {image.shape[0]}")
+    print("No crop / resize / rotation / inpaint was applied.")
 
 
 if __name__ == "__main__":
