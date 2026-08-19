@@ -4,134 +4,96 @@
 
 ## 当前主线
 
-现在先把系统收敛到最简单的四步：
+先稳定主体框架，不再保留已经放弃的 ResNet18 / 旧模板实验。
 
 ```text
-原始高分辨率图片
-    ↓
-产品整体矫正到唯一标准参考图
-    ↓
-固定 ROI（S01/S02/E01...）
-    ↓
-ROI 检测
+RAW 图像
+  ↓
+几何矫正
+  ├─ 失败：SKIP_ALIGNMENT，跳过检测并写日志
+  ↓
+统一检测坐标
+  ↓
+S / E / 弹簧 / 表面异常检测模块
+  ↓
+PASS / NG / ERROR
+  ↓
+结果映射回原图 + 检测日志
 ```
 
-当前阶段只做前两步：**先把产品矫正和固定 ROI 坐标彻底稳定**。
+矫正失败不算产品 NG；它属于前处理失败，必须跳过后续检测并单独记录。
 
-在矫正通过之前，不继续叠加 ResNet18、模板匹配、局部搜索或其他分类实验。
-
-## 唯一标准参考图
-
-正式几何基准只使用：
+## 当前保留源码
 
 ```text
-D:\Brunei\artifacts\reference\reference_aligned.png
+product_align_inspector/
+├─ alignment.py
+├─ canonical_frame.py
+├─ decision_rules.py
+├─ deploy_preprocess.py
+├─ inspection_pipeline.py
+├─ io_utils.py
+├─ roi.py
+├─ __init__.py
+└─ anomaly/
+   ├─ coreset.py
+   ├─ dinov2_adapter.py
+   ├─ roi_patchcore.py
+   └─ __init__.py
 ```
 
-ROI 配置必须是在这个参考图的同一坐标系中标注的。
-
-`brunei_preview.png` 只用于人工确认 ROI 位置，不再把它处理成新的 reference，也不再做 flip/remap。
-
-## 当前只需要的工具
+## 当前保留工具
 
 ```text
-tools\create_reference.py          创建标准参考图
-tools\align_image.py               单张产品矫正
-tools\align_folder.py              批量产品矫正
-tools\annotate_rois.py             在标准参考图上标固定 ROI
-tools\verify_rois.py               单张：矫正 + 固定 ROI 可视化
-tools\verify_alignment_dataset.py  批量：只验证矫正和固定 ROI
+tools/
+├─ align_folder.py
+├─ align_image.py
+├─ annotate_rois.py
+├─ build_roi_dino_patchcore.py
+├─ evaluate_roi_dino_patchcore.py
+├─ export_dinov2_onnx.py
+├─ export_runtime_bundle.py
+├─ extract_roi_dataset.py
+├─ inspect_roi_dino_patchcore.py
+├─ run_inspection_pipeline.py
+├─ smoke_test_roi_dino.py
+├─ verify_alignment_dataset.py
+└─ verify_rois.py
 ```
 
-`verify_rois.py` 和 `verify_alignment_dataset.py` 都会检查 ROI 配置尺寸是否与 reference 一致；不一致时直接停止，不自动缩放、不自动 remap。
+旧的 RAW reference 创建工具、alignment recovery 临时诊断、ResNet18 螺丝分类器和 canonical round-trip 临时工具已经移除。
 
-默认情况下，`foreground_quadrant` 这类无可靠 feature matrix 的 fallback 不算正式成功，应视为 RETRY。
+## 本地工作目录
 
-## 第一步：确认 ROI 配置
-
-你已经人工确认过的 ROI JSON 才能作为正式配置。
-
-在正式回写 `configs\brunei.json` 前，必须满足：
+大型数据、模型产物和参考图保持在本地，不提交到源码仓库。当前本地使用：
 
 ```text
-reference_width  == reference_aligned.png 宽度
-reference_height == reference_aligned.png 高度
+artifacts/reference/brunei_preview_reference.png
+artifacts/roi_dino_full/
+configs/brunei_preview.png
+configs/brunei_preview_template.json
+configs/brunei_preview_template_verify.png
+dataset_roi_dino/
+dataset_extra_ng/
 ```
 
-如果不一致，不要缩放坐标，先重新统一 reference / ROI 坐标系。
+`artifacts/` 已由 `.gitignore` 忽略；数据集也保持本地。
 
-## 第二步：只验证 GOOD 的矫正
+## PatchCore
 
-例如：
-
-```bat
-cd /d D:\Brunei
-python tools\verify_alignment_dataset.py ^
-  --input-root "D:\Brunei\dataset_roi_dino\test" ^
-  --reference "D:\Brunei\artifacts\reference\reference_aligned.png" ^
-  --config "D:\Brunei\configs\brunei_preview_template.json" ^
-  --scenario good ^
-  --output "D:\Brunei\artifacts\alignment_check_good"
-```
-
-输出：
-
-```text
-artifacts\alignment_check_good\
-├─ aligned\
-├─ overlays\
-├─ alignment_summary.csv
-└─ summary.json
-```
-
-这一步**没有任何螺丝识别**。
-
-只检查每张 `overlays`：同一套 S01/S02/E01... 固定框是否始终准确落在相同物理位置。
-
-目标：
-
-```text
-GOOD 01：ROI 正确
-GOOD 02：ROI 正确
-...
-GOOD 10：ROI 正确
-```
-
-如果某张走 fallback，或者固定 ROI 明显偏位，只修 alignment，不调检测模型。
-
-## 第三步：再做螺丝存在检测
-
-只有当矫正稳定以后，再做：
-
-```text
-S01/S02：应该有螺丝
-E01~E09：应该为空
-```
-
-这里的目标只是简单的 `screw present / empty`，不再同时混入对齐问题。
-
-## 第四步：表面瑕疵
-
-DINOv2 / PatchCore 继续保留，后面用于：
-
-- 划痕
-- 磕伤
-- 缺口
-- 污渍/异物
-- 其他未知表面异常
-
-它不再承担当前的产品几何矫正问题。
+DINOv2 / PatchCore 保留用于后续表面异常，例如划痕、磕伤、缺口、污渍和未知异常，不再作为螺丝存在/缺失的主要判断器。
 
 ## 部署原则
 
 开发/训练：Python。
 
-最终 Windows 工业端：
+最终 Windows 工业端目标：
 
 ```text
 C# / .NET 8
 OpenCvSharp
 ONNX Runtime
+Hikrobot MVS .NET SDK
 ```
 
-工业电脑不依赖 Python 环境。
+最终工业电脑不依赖 Python 环境。
