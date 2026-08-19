@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 from product_align_inspector.alignment import ProductLocatorConfig
 from product_align_inspector.inspection_pipeline import InspectionPipeline
 from product_align_inspector.io_utils import read_image
+from product_align_inspector.roi import config_reference_size, enabled_slots, roi_for_image, validate_roi
+from product_align_inspector.se_presence import EEmptyDetector, SPresenceDetector
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -27,34 +29,26 @@ def collect_images(root: Path) -> list[Path]:
 
 
 def validate_config(config: dict, reference_width: int, reference_height: int) -> str:
-    """Validate ROI bounds; return a short coordinate-system note."""
-    rw = config.get("reference_width")
-    rh = config.get("reference_height")
-    if rw is not None and rh is not None:
-        if (int(rw), int(rh)) != (reference_width, reference_height):
-            raise SystemExit(
-                f"CONFIG/REFERENCE SIZE MISMATCH: config={rw}x{rh}, "
-                f"reference={reference_width}x{reference_height}"
-            )
-        note = f"declared {int(rw)}x{int(rh)}"
+    """Validate ROI mapping into the current canonical/reference image."""
+    source_size = config_reference_size(config)
+    if source_size is None:
+        note = f"ROI size not declared; coordinates treated as {reference_width}x{reference_height}"
+    elif source_size == (reference_width, reference_height):
+        note = f"ROI coordinates already canonical: {source_size[0]}x{source_size[1]}"
     else:
-        note = "size not declared in JSON; ROI bounds checked only"
+        sx = reference_width / float(source_size[0])
+        sy = reference_height / float(source_size[1])
+        note = (
+            f"fixed ROI coordinate mapping {source_size[0]}x{source_size[1]} -> "
+            f"{reference_width}x{reference_height} (sx={sx:.6f}, sy={sy:.6f})"
+        )
 
-    for slot in config.get("screw_slots", []):
-        if not bool(slot.get("enabled", True)):
-            continue
-        roi = slot.get("roi")
-        if roi is None:
-            continue
-        if not isinstance(roi, (list, tuple)) or len(roi) != 4:
-            raise SystemExit(f"Invalid ROI for {slot.get('id', '?')}: {roi}")
-        x, y, w, h = map(int, roi)
-        if w <= 0 or h <= 0:
-            raise SystemExit(f"Invalid ROI size for {slot.get('id', '?')}: {roi}")
-        if x < 0 or y < 0 or x + w > reference_width or y + h > reference_height:
+    for slot in enabled_slots(config):
+        roi = roi_for_image(slot["roi"], config, reference_width, reference_height)
+        if not validate_roi(roi, reference_width, reference_height):
             raise SystemExit(
-                f"ROI OUT OF CANONICAL BOUNDS for {slot.get('id', '?')}: {roi}; "
-                f"reference={reference_width}x{reference_height}"
+                f"ROI OUT OF CANONICAL BOUNDS for {slot.get('id', '?')}: "
+                f"source={slot.get('roi')} mapped={roi}; reference={reference_width}x{reference_height}"
             )
     return note
 
@@ -62,7 +56,7 @@ def validate_config(config: dict, reference_width: int, reference_height: int) -
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "RAW -> canonical preview reference -> ROI coordinate chain -> inverse mapping to RAW. "
+            "RAW -> canonical reference -> independent S/E detectors -> inverse-map results to RAW. "
             "Per-frame geometry is rigid only: rotation + X/Y translation, scale=1."
         )
     )
@@ -74,8 +68,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        help="Optional canonical ROI JSON, e.g. configs/brunei_preview_template.json",
+        help="ROI JSON, e.g. configs/brunei_preview_template.json",
     )
+    parser.add_argument("--s-model", help="S screw-present model directory")
+    parser.add_argument("--e-model", help="E empty model directory")
     parser.add_argument("--output", required=True)
     parser.add_argument("--ecc-accept", type=float, default=0.70)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.10)
@@ -98,6 +94,8 @@ def main() -> None:
         config_path = Path(args.config).resolve()
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config_note = validate_config(config, ref_w, ref_h)
+    elif args.s_model or args.e_model:
+        raise SystemExit("--config is required when S/E models are enabled.")
 
     align_cfg = ProductLocatorConfig(
         ecc_accept_score=float(args.ecc_accept),
@@ -105,11 +103,17 @@ def main() -> None:
         canonical_scale=1.0,
     )
 
+    detectors = []
+    if args.s_model:
+        detectors.append(SPresenceDetector(Path(args.s_model).resolve(), config or {}))
+    if args.e_model:
+        detectors.append(EEmptyDetector(Path(args.e_model).resolve(), config or {}))
+
     pipeline = InspectionPipeline(
         reference=reference,
         output_dir=output,
         align_cfg=align_cfg,
-        detectors=[],
+        detectors=detectors,
         config=config,
         save_aligned=not args.no_save_canonical,
         save_overlay=not args.no_save_overlay,
@@ -126,6 +130,9 @@ def main() -> None:
 
     rows: list[dict[str, object]] = []
     counts: Counter[str] = Counter()
+    detector_counts: dict[str, Counter[str]] = {
+        getattr(detector, "name", detector.__class__.__name__): Counter() for detector in detectors
+    }
 
     print("=== ProductAlignInspector Main Framework ===")
     print(f"Input root:       {input_root}")
@@ -137,7 +144,9 @@ def main() -> None:
     print(f"Images:           {len(files)}")
     print("Geometry:         rotation + X/Y translation ONLY")
     print("Scale:            FIXED 1.00000")
-    print("Flow: RAW -> canonical -> ROI/detector hook -> inverse-map to RAW")
+    print(f"S detector:       {Path(args.s_model).resolve() if args.s_model else 'OFF'}")
+    print(f"E detector:       {Path(args.e_model).resolve() if args.e_model else 'OFF'}")
+    print("Flow: RAW -> canonical -> S/E -> inverse-map result to RAW")
     print("Alignment failure: SKIP_ALIGNMENT + log; detectors are not executed")
     print()
 
@@ -150,6 +159,13 @@ def main() -> None:
             jsonl.flush()
 
             counts[record.final_status] += 1
+            detector_summary = []
+            for detection in record.detections:
+                name = str(detection.get("detector", "?"))
+                status = str(detection.get("status", "?"))
+                detector_counts.setdefault(name, Counter())[status] += 1
+                detector_summary.append(f"{name}={status}")
+
             rows.append(
                 {
                     "timestamp": record.timestamp,
@@ -166,6 +182,8 @@ def main() -> None:
                     "tx": record.tx,
                     "ty": record.ty,
                     "ecc": record.alignment_ecc,
+                    "S_status": next((d.get("status", "") for d in record.detections if d.get("detector") == "S_presence"), ""),
+                    "E_status": next((d.get("status", "") for d in record.detections if d.get("detector") == "E_empty"), ""),
                     "alignment_time_sec": record.alignment_time_sec,
                     "total_time_sec": record.total_time_sec,
                     "canonical_path": record.canonical_path,
@@ -176,30 +194,16 @@ def main() -> None:
             )
 
             if record.final_status == "SKIP_ALIGNMENT":
-                print(
-                    f"[{index}/{len(files)}] {rel.as_posix()} -> SKIP_ALIGNMENT | "
-                    f"{record.error}"
-                )
+                print(f"[{index}/{len(files)}] {rel.as_posix()} -> SKIP_ALIGNMENT | {record.error}")
             elif record.alignment_status == "OK":
-                ecc = (
-                    "-"
-                    if record.alignment_ecc is None
-                    else f"{record.alignment_ecc:.4f}"
-                )
-                rot = (
-                    "-"
-                    if record.rotation_deg is None
-                    else f"{record.rotation_deg:.3f}"
-                )
+                ecc = "-" if record.alignment_ecc is None else f"{record.alignment_ecc:.4f}"
+                detect_text = " | ".join(detector_summary) if detector_summary else "detectors=OFF"
                 print(
                     f"[{index}/{len(files)}] {rel.as_posix()} -> {record.final_status} | "
-                    f"scale=1.00000 rot={rot} ecc={ecc} | {record.total_time_sec:.3f}s"
+                    f"ecc={ecc} | {detect_text} | {record.total_time_sec:.3f}s"
                 )
             else:
-                print(
-                    f"[{index}/{len(files)}] {rel.as_posix()} -> "
-                    f"{record.final_status} | {record.error}"
-                )
+                print(f"[{index}/{len(files)}] {rel.as_posix()} -> {record.final_status} | {record.error}")
 
     fields = list(rows[0].keys()) if rows else []
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -216,34 +220,21 @@ def main() -> None:
         "canonical_reference": str(reference_path),
         "canonical_size": [ref_w, ref_h],
         "roi_config": str(Path(args.config).resolve()) if args.config else None,
-        "geometry": {
-            "rotation": True,
-            "translation_x": True,
-            "translation_y": True,
-            "scale": 1.0,
-            "shear": False,
-            "perspective": False,
+        "roi_mapping": config_note,
+        "detectors": {
+            name: dict(counter) for name, counter in detector_counts.items()
         },
-        "detectors_plugged_in": False,
-        "next_detector_slots": [
-            "S_presence",
-            "E_empty",
-            "spring",
-            "surface_anomaly",
-        ],
         "logs": {"jsonl": str(jsonl_path), "csv": str(csv_path)},
     }
-    summary_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print()
     print("=== Summary ===")
     print(f"Images:            {len(files)}")
     print(f"Alignment OK:      {summary['alignment_ok']}")
     print(f"Alignment skipped: {summary['alignment_skipped']}")
-    print("Scale:             1.00000 (fixed)")
+    for name, counter in detector_counts.items():
+        print(f"{name}: {dict(counter)}")
     print(f"Canonical:         {output / 'canonical'}")
     print(f"Overlays:          {output / 'overlays'}")
     print(f"Restored:          {output / 'restored'}")
