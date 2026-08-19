@@ -7,7 +7,6 @@ from pathlib import Path
 
 import cv2
 
-# Allow direct execution: python tools\verify_rois.py ...
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -28,13 +27,25 @@ def _draw_label(image, roi, label: str, color: tuple[int, int, int]) -> None:
     cv2.putText(image, label, (x + 4, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
+def _verify_config_matches_reference(reference, config: dict) -> None:
+    h, w = reference.shape[:2]
+    cfg_w = config.get("reference_width")
+    cfg_h = config.get("reference_height")
+    if cfg_w is not None and cfg_h is not None and (int(cfg_w), int(cfg_h)) != (w, h):
+        raise SystemExit(
+            f"CONFIG/REFERENCE SIZE MISMATCH: config={cfg_w}x{cfg_h}, reference={w}x{h}. "
+            "Do not scale/remap ROIs automatically; use the ROI JSON annotated on this exact reference."
+        )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Align one image, draw configured ROIs and export each ROI crop.")
+    parser = argparse.ArgumentParser(description="Align one image, draw fixed ROIs, and export crops. No detection is performed.")
     parser.add_argument("--input", required=True, help="Raw input image")
-    parser.add_argument("--reference", required=True, help="Canonical reference_aligned.png")
-    parser.add_argument("--config", required=True, help="Product ROI JSON created by annotate_rois.py")
+    parser.add_argument("--reference", required=True, help="Canonical clean reference_aligned.png")
+    parser.add_argument("--config", required=True, help="ROI JSON annotated on the same canonical reference")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--threshold", type=int, default=238)
+    parser.add_argument("--allow-foreground-fallback", action="store_true")
     args = parser.parse_args()
 
     out = Path(args.output)
@@ -44,15 +55,22 @@ def main() -> None:
     reference = read_image(args.reference)
     config_path = Path(args.config)
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    _verify_config_matches_reference(reference, config)
 
     result = align_to_reference(image, reference, ProductLocatorConfig(foreground_threshold=args.threshold))
+    if result.feature_matrix is None and not args.allow_foreground_fallback:
+        raise SystemExit(
+            f"Alignment is fallback-only ({result.method}); treat this image as RETRY, not as a product NG."
+        )
+
     aligned = result.aligned
     preview = aligned.copy()
     h, w = aligned.shape[:2]
-
     rows: list[dict[str, object]] = []
 
     for slot in config.get("screw_slots", []):
+        if not bool(slot.get("enabled", True)):
+            continue
         slot_id = str(slot.get("id", "S?"))
         expected = str(slot.get("expected", "unknown"))
         roi = slot.get("roi")
@@ -66,6 +84,8 @@ def main() -> None:
         rows.append({"id": slot_id, "type": "screw_slot", "expected": expected, "status": "ok", "roi": list(map(int, roi))})
 
     for region in config.get("spring_regions", []):
+        if not bool(region.get("enabled", True)):
+            continue
         region_id = str(region.get("id", "SPRING?"))
         expected_count = int(region.get("expected_count", 0))
         roi = region.get("roi")
@@ -79,16 +99,7 @@ def main() -> None:
 
     write_image(out / "aligned.png", aligned)
     write_image(out / "roi_preview.png", preview)
-    write_json(
-        out / "verification.json",
-        {
-            "input": str(Path(args.input)),
-            "reference": str(Path(args.reference)),
-            "config": str(config_path),
-            "alignment": result.to_dict(),
-            "rois": rows,
-        },
-    )
+    write_json(out / "verification.json", {"input": str(Path(args.input)), "reference": str(Path(args.reference)), "config": str(config_path), "alignment": result.to_dict(), "rois": rows})
 
     print(f"Method: {result.method}")
     print(f"Feature matches: {result.feature_matches}, inliers: {result.feature_inliers} ({result.feature_inlier_ratio:.1%})")
