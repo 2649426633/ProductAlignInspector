@@ -12,6 +12,7 @@ import numpy as np
 from .alignment import ProductLocatorConfig, align_to_reference, make_overlay
 from .canonical_frame import roi_to_polygon, transform_points
 from .io_utils import read_image, write_image, write_json
+from .roi import enabled_slots, roi_for_image
 
 
 class Detector(Protocol):
@@ -62,23 +63,26 @@ class InspectionRecord:
         return asdict(self)
 
 
-def _enabled_rois(config: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not config:
-        return []
-    rows: list[dict[str, Any]] = []
-    for slot in config.get("screw_slots", []):
-        if bool(slot.get("enabled", True)) and slot.get("roi") is not None:
-            rows.append(slot)
-    return rows
+def _slot_color(expected: str, status: str | None = None) -> tuple[int, int, int]:
+    if status == "NG":
+        return (0, 0, 255)
+    if status == "PASS":
+        return (0, 210, 0)
+    return (60, 210, 60) if expected == "screw" else (0, 170, 255)
 
 
-def _draw_canonical_rois(image: np.ndarray, config: dict[str, Any] | None) -> np.ndarray:
+def _draw_config_on_canonical(
+    image: np.ndarray,
+    config: dict[str, Any] | None,
+) -> np.ndarray:
     out = image.copy()
-    for slot in _enabled_rois(config):
-        x, y, w, h = map(int, slot["roi"])
+    h, w = out.shape[:2]
+    for slot in enabled_slots(config):
+        roi = roi_for_image(slot["roi"], config, w, h)
+        x, y, rw, rh = map(int, roi)
         expected = str(slot.get("expected", ""))
-        color = (0, 190, 0) if expected == "screw" else (0, 150, 220)
-        cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+        color = _slot_color(expected)
+        cv2.rectangle(out, (x, y), (x + rw, y + rh), color, 2)
         cv2.putText(
             out,
             f"{slot.get('id', '?')}:{expected}",
@@ -92,17 +96,20 @@ def _draw_canonical_rois(image: np.ndarray, config: dict[str, Any] | None) -> np
     return out
 
 
-def _draw_rois_back_on_raw(
+def _draw_config_back_on_raw(
     raw: np.ndarray,
     config: dict[str, Any] | None,
     canonical_to_input: np.ndarray,
+    canonical_size: tuple[int, int],
 ) -> np.ndarray:
     out = raw.copy()
     thickness = max(2, int(round(min(raw.shape[:2]) / 1200)))
-    for slot in _enabled_rois(config):
+    cw, ch = canonical_size
+    for slot in enabled_slots(config):
         expected = str(slot.get("expected", ""))
-        color = (0, 190, 0) if expected == "screw" else (0, 150, 220)
-        polygon = transform_points(roi_to_polygon(slot["roi"]), canonical_to_input)
+        color = _slot_color(expected)
+        roi = roi_for_image(slot["roi"], config, cw, ch)
+        polygon = transform_points(roi_to_polygon(roi), canonical_to_input)
         polygon_i = np.round(polygon).astype(np.int32)
         cv2.polylines(out, [polygon_i], True, color, thickness, cv2.LINE_AA)
         x, y = polygon_i[0].tolist()
@@ -114,6 +121,74 @@ def _draw_rois_back_on_raw(
             0.9,
             color,
             max(2, thickness - 1),
+            cv2.LINE_AA,
+        )
+    return out
+
+
+def _iter_detection_slots(detection_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    slots: list[dict[str, Any]] = []
+    for row in detection_rows:
+        details = row.get("details") or {}
+        for slot in details.get("slots", []):
+            if slot.get("roi_canonical") is not None:
+                slots.append(slot)
+    return slots
+
+
+def _draw_detection_slots_on_canonical(
+    image: np.ndarray,
+    detection_rows: list[dict[str, Any]],
+) -> np.ndarray:
+    out = image.copy()
+    for slot in _iter_detection_slots(detection_rows):
+        x, y, w, h = map(int, slot["roi_canonical"])
+        status = str(slot.get("status", ""))
+        expected = str(slot.get("expected", ""))
+        color = _slot_color(expected, status)
+        cv2.rectangle(out, (x, y), (x + w, y + h), color, 3)
+        score = slot.get("score")
+        threshold = slot.get("threshold")
+        text = f"{slot.get('id', '?')}:{status}"
+        if score is not None and threshold is not None:
+            text += f" {float(score):.3f}/{float(threshold):.3f}"
+        cv2.putText(
+            out,
+            text,
+            (x, max(26, y - 7)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+def _draw_detection_slots_on_raw(
+    raw: np.ndarray,
+    detection_rows: list[dict[str, Any]],
+    canonical_to_input: np.ndarray,
+) -> np.ndarray:
+    out = raw.copy()
+    thickness = max(2, int(round(min(raw.shape[:2]) / 1200)))
+    for slot in _iter_detection_slots(detection_rows):
+        expected = str(slot.get("expected", ""))
+        status = str(slot.get("status", ""))
+        color = _slot_color(expected, status)
+        polygon = transform_points(roi_to_polygon(slot["roi_canonical"]), canonical_to_input)
+        polygon_i = np.round(polygon).astype(np.int32)
+        cv2.polylines(out, [polygon_i], True, color, thickness + 1, cv2.LINE_AA)
+        x, y = polygon_i[0].tolist()
+        label = f"{slot.get('id', '?')}:{status}"
+        cv2.putText(
+            out,
+            label,
+            (int(x), max(32, int(y) - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            color,
+            max(2, thickness),
             cv2.LINE_AA,
         )
     return out
@@ -231,21 +306,6 @@ class InspectionPipeline:
             write_image(target, canonical)
             canonical_path = str(target)
 
-        if self.save_overlay:
-            target = self.output_dir / "overlays" / rel.with_suffix(".jpg")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            overlay = make_overlay(self.reference, canonical)
-            overlay = _draw_canonical_rois(overlay, self.config)
-            write_image(target, overlay)
-            overlay_path = str(target)
-
-        if self.save_restored:
-            target = self.output_dir / "restored" / rel.with_suffix(".jpg")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            restored = _draw_rois_back_on_raw(raw, self.config, canonical_to_input)
-            write_image(target, restored)
-            restored_path = str(target)
-
         tx: float | None = None
         ty: float | None = None
         if alignment.rigid_translation_xy is not None:
@@ -269,19 +329,9 @@ class InspectionPipeline:
             alignment_time_sec=alignment_time,
             canonical_path=canonical_path,
             aligned_path=canonical_path,
-            overlay_path=overlay_path,
-            restored_path=restored_path,
             input_to_canonical=np.asarray(input_to_canonical).tolist(),
             canonical_to_input=np.asarray(canonical_to_input).tolist(),
         )
-
-        if not self.detectors:
-            return InspectionRecord(
-                **common,
-                final_status="READY_FOR_DETECTION",
-                detection_run=False,
-                total_time_sec=perf_counter() - started,
-            )
 
         ctx.update(
             {
@@ -297,19 +347,55 @@ class InspectionPipeline:
         detection_rows: list[dict[str, Any]] = []
         any_ng = False
         any_error = False
-        for detector in self.detectors:
-            try:
-                result = detector.inspect(canonical, ctx)
-            except Exception as exc:
-                result = DetectionResult(
-                    detector=getattr(detector, "name", detector.__class__.__name__),
-                    status="ERROR",
-                    reason=str(exc),
-                )
-            detection_rows.append(asdict(result))
-            status = str(result.status).upper()
-            any_ng = any_ng or status == "NG"
-            any_error = any_error or status == "ERROR"
+        if self.detectors:
+            for detector in self.detectors:
+                try:
+                    result = detector.inspect(canonical, ctx)
+                except Exception as exc:
+                    result = DetectionResult(
+                        detector=getattr(detector, "name", detector.__class__.__name__),
+                        status="ERROR",
+                        reason=str(exc),
+                    )
+                detection_rows.append(asdict(result))
+                status = str(result.status).upper()
+                any_ng = any_ng or status == "NG"
+                any_error = any_error or status == "ERROR"
+
+        if self.save_overlay:
+            target = self.output_dir / "overlays" / rel.with_suffix(".jpg")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            overlay = make_overlay(self.reference, canonical)
+            overlay = _draw_config_on_canonical(overlay, self.config)
+            if detection_rows:
+                overlay = _draw_detection_slots_on_canonical(overlay, detection_rows)
+            write_image(target, overlay)
+            overlay_path = str(target)
+
+        if self.save_restored:
+            target = self.output_dir / "restored" / rel.with_suffix(".jpg")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            restored = _draw_config_back_on_raw(
+                raw,
+                self.config,
+                canonical_to_input,
+                (canonical.shape[1], canonical.shape[0]),
+            )
+            if detection_rows:
+                restored = _draw_detection_slots_on_raw(restored, detection_rows, canonical_to_input)
+            write_image(target, restored)
+            restored_path = str(target)
+
+        common["overlay_path"] = overlay_path
+        common["restored_path"] = restored_path
+
+        if not self.detectors:
+            return InspectionRecord(
+                **common,
+                final_status="READY_FOR_DETECTION",
+                detection_run=False,
+                total_time_sec=perf_counter() - started,
+            )
 
         if any_error:
             final_status = "ERROR"
