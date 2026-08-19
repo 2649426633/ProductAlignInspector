@@ -4,125 +4,125 @@
 
 ## 当前固定主线
 
-现在统一使用本地模板：
+本地 canonical 模板：
 
 ```text
 artifacts/reference/brunei_preview_reference.png
 ```
 
-它就是检测的 canonical 坐标系。当前流程固定为：
+生产流程：
 
 ```text
-RAW 原图（例如 5472x3648）
+RAW 原图
   ↓
-SIFT similarity：统一坐标缩放 + 旋转 + X/Y 平移
+SIFT/RANSAC 找可靠对应点
   ↓
-Euclidean ECC：只微调旋转 + X/Y 平移
+最终刚体矫正：rotation + X/Y translation，scale=1
   ↓
-canonical 图（brunei_preview_reference.png 的尺寸）
+Euclidean ECC 微调：仍然只允许 rotation + X/Y translation
   ↓
-固定 ROI：S01/S02/E01...E09
+canonical 图
   ↓
-S / E / 弹簧 / 表面异常检测
+固定 ROI 坐标映射
+  ↓
+S_presence + E_empty 两个独立检测器
   ↓
 canonical_to_input 逆矩阵
   ↓
-检测框映射回原始 RAW 图
+检测框映射回 RAW 原图
   ↓
 PASS / NG / ERROR + 日志
 ```
 
-禁止使用非等比例 X/Y 拉伸、shear 或透视变换。
+矫正失败不算产品 NG：`SKIP_ALIGNMENT`、不执行检测、写日志、继续下一张。
 
-矫正失败不算产品 NG。失败帧必须：
+## ROI 坐标
 
-```text
-SKIP_ALIGNMENT
-检测不运行
-detection_run = false
-写入日志
-继续下一张
-```
+`brunei_preview_template.json` 中的 ROI 可以保持原来的标注坐标系。若 ROI JSON 的
+`coordinate_system.image_width/image_height` 与当前 canonical 图片尺寸不同，系统只做一次
+固定坐标换算，不会把它当成每张图片的几何变化。
 
-## 本地固定资源
+## S / E 两个独立模型
+
+S 与 E 不共用模型：
 
 ```text
-artifacts/reference/brunei_preview_reference.png
-configs/brunei_preview.png
-configs/brunei_preview_template.json
-configs/brunei_preview_template_verify.png
-artifacts/roi_dino_full/
-dataset_roi_dino/
-dataset_extra_ng/
+S_presence
+  S01/S02 正常状态 = 有螺丝
+  异常 = missing_screw
+
+E_empty
+  E01...E09 正常状态 = 空
+  异常 = excess_screw
 ```
 
-这些大文件/数据保持本地，不提交到源码仓库。
+当前先使用轻量 GOOD-only 外观 bank：CLAHE + 灰度结构 + Scharr 梯度，最近邻余弦距离。
+它不依赖 PyTorch，后面容易迁移到 OpenCvSharp/C#。PatchCore 继续保留给表面异常，不承担螺丝存在/缺失。
 
-## 主体源码
-
-```text
-product_align_inspector/
-├─ alignment.py            RAW -> canonical 对齐，保存正/逆矩阵
-├─ canonical_frame.py      canonical ROI/点 <-> RAW 坐标转换
-├─ inspection_pipeline.py  主检测流水线，失败跳过并写日志
-├─ decision_rules.py
-├─ deploy_preprocess.py
-├─ io_utils.py
-├─ roi.py
-├─ __init__.py
-└─ anomaly/
-   ├─ coreset.py
-   ├─ dinov2_adapter.py
-   ├─ roi_patchcore.py
-   └─ __init__.py
-```
-
-## 先测试主体坐标链
-
-当前还不接 S/E 检测器，先验证 101 张正式测试图片：
+### 1. 用 50 张 train/good 建 S 和 E 两套模型
 
 ```bat
-cd /d D:\Brunei
-
-python tools\run_inspection_pipeline.py ^
-  --input-root "D:\Brunei\dataset_roi_dino\test" ^
+python tools\build_se_presence_models.py ^
+  --train-good "D:\Brunei\dataset_roi_dino\train\good" ^
   --reference "D:\Brunei\artifacts\reference\brunei_preview_reference.png" ^
   --config "D:\Brunei\configs\brunei_preview_template.json" ^
-  --output "D:\Brunei\artifacts\framework_final_test"
+  --output "D:\Brunei\artifacts\se_presence"
 ```
 
 输出：
 
 ```text
-artifacts/framework_final_test/
-├─ canonical/             对齐后的 canonical 图片
-├─ overlays/              canonical 与 reference 的 50/50 叠加 + ROI
-├─ restored/              ROI 逆映射回原始 RAW 图
-├─ inspection_log.jsonl
-├─ inspection_summary.csv
-└─ summary.json
+artifacts/se_presence/
+├─ S/
+│  ├─ model.json
+│  └─ banks/S01.npy, S02.npy
+├─ E/
+│  ├─ model.json
+│  └─ banks/E01.npy ... E09.npy
+└─ build_summary.json
 ```
 
-`summary.json` 会统计本轮成功帧测得的 RAW->canonical uniform scale。等该 scale 在正常样本上稳定以后，再用：
+### 2. 接入主流水线测试 101 张
+
+```bat
+python tools\run_inspection_pipeline.py ^
+  --input-root "D:\Brunei\dataset_roi_dino\test" ^
+  --reference "D:\Brunei\artifacts\reference\brunei_preview_reference.png" ^
+  --config "D:\Brunei\configs\brunei_preview_template.json" ^
+  --s-model "D:\Brunei\artifacts\se_presence\S" ^
+  --e-model "D:\Brunei\artifacts\se_presence\E" ^
+  --output "D:\Brunei\artifacts\se_detection_test"
+```
+
+`overlays/` 显示 canonical 上的 PASS/NG ROI；`restored/` 把同一检测结果映射回 RAW 原图。
+`inspection_summary.csv` 会分别记录 `S_status` 和 `E_status`。
+
+## 主体源码
 
 ```text
---canonical-scale <固定值>
+product_align_inspector/
+├─ alignment.py
+├─ canonical_frame.py
+├─ inspection_pipeline.py
+├─ se_presence.py
+├─ roi.py
+├─ decision_rules.py
+├─ deploy_preprocess.py
+├─ io_utils.py
+├─ __init__.py
+└─ anomaly/
 ```
-
-把 coordinate scale 锁死。之后每一帧只允许旋转和 X/Y 平移变化。
 
 ## 后续模块顺序
 
 ```text
 1. 主体对齐 + 坐标回映
-2. S01/S02：应该有螺丝
-3. E01~E09：应该为空
+2. S_presence / E_empty 基线验证
+3. 根据 101 张结果分别调 S 与 E 阈值/特征
 4. PASS/NG 规则
 5. PatchCore 表面异常
 6. WinForms + Hikrobot 相机
 ```
-
-DINOv2 / PatchCore 保留用于划痕、磕伤、缺口、污渍和未知表面异常，不作为螺丝存在/缺失的主要判断器。
 
 ## 部署目标
 
@@ -133,7 +133,7 @@ DINOv2 / PatchCore 保留用于划痕、磕伤、缺口、污渍和未知表面�
 ```text
 C# / .NET 8
 OpenCvSharp
-ONNX Runtime
+ONNX Runtime（需要时）
 Hikrobot MVS .NET SDK
 ```
 
