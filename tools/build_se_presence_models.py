@@ -17,6 +17,7 @@ from product_align_inspector.roi import config_reference_size, crop_roi, enabled
 from product_align_inspector.se_presence import PresenceDescriptorConfig, appearance_descriptor
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+THRESHOLD_PROFILES = {"strict", "recommended", "loose"}
 
 
 def collect_images(root: Path) -> list[Path]:
@@ -24,141 +25,127 @@ def collect_images(root: Path) -> list[Path]:
 
 
 def _topk_distance(vector: np.ndarray, bank: np.ndarray, top_k: int, exclude: int | None = None) -> float:
-    similarity = np.asarray(bank, dtype=np.float32) @ np.asarray(vector, dtype=np.float32)
-    distances = 1.0 - similarity
+    distances = 1.0 - np.asarray(bank, dtype=np.float32) @ np.asarray(vector, dtype=np.float32)
     if exclude is not None and 0 <= exclude < distances.size:
         distances = distances.copy()
         distances[exclude] = np.inf
     finite = distances[np.isfinite(distances)]
     if finite.size == 0:
-        raise RuntimeError("No neighbors available for calibration.")
+        raise RuntimeError("No neighbors available for slot calibration.")
     k = max(1, min(int(top_k), finite.size))
     return float(np.mean(np.partition(finite, k - 1)[:k]))
 
 
-def _calibrate_thresholds(screw_bank: np.ndarray, empty_bank: np.ndarray, top_k: int) -> tuple[float, float, dict]:
-    screw_margins = []
-    for i, vector in enumerate(screw_bank):
-        d_screw = _topk_distance(vector, screw_bank, top_k, exclude=i)
-        d_empty = _topk_distance(vector, empty_bank, top_k)
-        screw_margins.append(d_empty - d_screw)
+def _slot_calibration(bank: np.ndarray, top_k: int) -> dict:
+    if bank.ndim != 2 or bank.shape[0] < 3:
+        raise RuntimeError(f"Not enough GOOD samples for slot calibration: {bank.shape}")
 
-    empty_margins = []
-    for i, vector in enumerate(empty_bank):
-        d_screw = _topk_distance(vector, screw_bank, top_k)
-        d_empty = _topk_distance(vector, empty_bank, top_k, exclude=i)
-        empty_margins.append(d_empty - d_screw)
+    distances = np.asarray(
+        [_topk_distance(vector, bank, top_k, exclude=i) for i, vector in enumerate(bank)],
+        dtype=np.float32,
+    )
+    median = float(np.median(distances))
+    mad = float(np.median(np.abs(distances - median)))
+    robust_sigma = 1.4826 * mad
+    p95 = float(np.quantile(distances, 0.95))
+    p99 = float(np.quantile(distances, 0.99))
+    max_good = float(np.max(distances))
 
-    screw_margins = np.asarray(screw_margins, dtype=np.float32)
-    empty_margins = np.asarray(empty_margins, dtype=np.float32)
+    # Three practical operating points. All are calculated independently for each ROI.
+    # strict:       lowest false-negative tolerance, higher false-alarm risk.
+    # recommended:  default production starting point.
+    # loose:        lower false-alarm risk, but may miss subtle defects.
+    strict = max(max_good * 1.05 + 0.001, p99 + 0.001)
+    recommended = max(max_good * 1.15 + 0.002, median + 6.0 * robust_sigma)
+    loose = max(max_good * 1.30 + 0.004, median + 8.0 * robust_sigma)
 
-    screw_low = float(np.quantile(screw_margins, 0.01))
-    empty_high = float(np.quantile(empty_margins, 0.99))
-    if empty_high < screw_low:
-        gap = screw_low - empty_high
-        s_threshold = screw_low - 0.15 * gap
-        e_threshold = empty_high + 0.15 * gap
-        calibration = "separated"
-    else:
-        screw_med = float(np.median(screw_margins))
-        empty_med = float(np.median(empty_margins))
-        boundary = 0.5 * (screw_med + empty_med)
-        s_threshold = boundary
-        e_threshold = boundary
-        calibration = "overlap"
-
-    stats = {
-        "calibration": calibration,
-        "margin_definition": "distance_empty - distance_screw; positive=screw-like, negative=empty-like",
-        "screw": {
-            "count": int(screw_margins.size),
-            "min": float(screw_margins.min()),
-            "p01": screw_low,
-            "median": float(np.median(screw_margins)),
-            "max": float(screw_margins.max()),
+    return {
+        "samples": int(bank.shape[0]),
+        "descriptor_dim": int(bank.shape[1]),
+        "top_k": int(top_k),
+        "good_distance": {
+            "min": float(np.min(distances)),
+            "median": median,
+            "mean": float(np.mean(distances)),
+            "p95": p95,
+            "p99": p99,
+            "max": max_good,
+            "mad": mad,
+            "robust_sigma": float(robust_sigma),
         },
-        "empty": {
-            "count": int(empty_margins.size),
-            "min": float(empty_margins.min()),
-            "median": float(np.median(empty_margins)),
-            "p99": empty_high,
-            "max": float(empty_margins.max()),
+        "suggested_thresholds": {
+            "strict": float(strict),
+            "recommended": float(recommended),
+            "loose": float(loose),
         },
-        "S_threshold": float(s_threshold),
-        "E_threshold": float(e_threshold),
     }
-    return float(s_threshold), float(e_threshold), stats
 
 
-def _save_model(
+def _save_group_model(
     output_dir: Path,
     *,
     expected: str,
     detector_name: str,
-    threshold: float,
-    screw_bank: np.ndarray,
-    empty_bank: np.ndarray,
+    slot_banks: dict[str, np.ndarray],
     config: dict,
     canonical_size: tuple[int, int],
     descriptor_cfg: PresenceDescriptorConfig,
     top_k: int,
+    threshold_profile: str,
     images_seen: int,
     alignment_ok: int,
     skipped: list[dict],
-    calibration_stats: dict,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     banks_dir = output_dir / "banks"
     banks_dir.mkdir(parents=True, exist_ok=True)
     for old in banks_dir.glob("*.npy"):
         old.unlink()
-    np.save(banks_dir / "screw.npy", screw_bank.astype(np.float32))
-    np.save(banks_dir / "empty.npy", empty_bank.astype(np.float32))
+
+    slot_models: dict[str, dict] = {}
+    for slot_id, bank in slot_banks.items():
+        calibration = _slot_calibration(bank, top_k)
+        suggestions = calibration["suggested_thresholds"]
+        threshold = float(suggestions[threshold_profile])
+        bank_rel = f"banks/{slot_id}.npy"
+        np.save(output_dir / bank_rel, bank.astype(np.float32))
+        slot_models[slot_id] = {
+            "bank": bank_rel,
+            "top_k": int(top_k),
+            "threshold": threshold,
+            "threshold_profile": threshold_profile,
+            "suggested_thresholds": suggestions,
+            "calibration": calibration,
+        }
 
     roi_size = config_reference_size(config)
-    if expected == "screw":
-        normal = "margin >= threshold"
-        ng = "margin < threshold"
-        ng_reason = "missing_screw"
-    else:
-        normal = "margin <= threshold"
-        ng = "margin > threshold"
-        ng_reason = "excess_screw"
-
     model = {
-        "schema_version": 3,
+        "schema_version": 4,
         "detector": detector_name,
         "expected": expected,
         "canonical_size": [int(canonical_size[0]), int(canonical_size[1])],
         "roi_coordinate_size": None if roi_size is None else [int(roi_size[0]), int(roi_size[1])],
         "descriptor": {
-            "type": "radial_presence_v3",
+            "type": "slotwise_radial_v4",
             "size": int(descriptor_cfg.size),
             "center_crop_ratio": float(descriptor_cfg.center_crop_ratio),
             "radial_bins": int(descriptor_cfg.radial_bins),
             "hist_bins": int(descriptor_cfg.hist_bins),
         },
         "classifier": {
-            "type": "dual_bank_topk_cosine",
+            "type": "slotwise_good_topk_cosine",
             "top_k": int(top_k),
-            "threshold": float(threshold),
-            "margin": "distance_empty - distance_screw",
+            "threshold_profile": threshold_profile,
+            "decision": "PASS when score <= the threshold stored for that exact slot",
         },
         "training": {
             "images_seen": int(images_seen),
             "alignment_ok": int(alignment_ok),
             "alignment_skipped": int(images_seen - alignment_ok),
             "skipped": skipped,
-            "source": "GOOD only: real S slots provide screw class; real E slots provide empty class",
-            "screw_samples": int(screw_bank.shape[0]),
-            "empty_samples": int(empty_bank.shape[0]),
+            "source": "GOOD only; every S/E position has its own bank and its own threshold",
         },
-        "calibration": calibration_stats,
-        "decision": {
-            "normal": normal,
-            "ng": ng,
-            "ng_reason": ng_reason,
-        },
+        "slots": slot_models,
     }
     (output_dir / "model.json").write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     return model
@@ -167,9 +154,8 @@ def _save_model(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build independent S/E models from GOOD images only. Each GOOD image already contains "
-            "real screw examples in S01/S02 and real empty examples in E01..E09, so no NG test "
-            "images are used for training."
+            "Build slot-wise S/E GOOD-only models. S01/S02 and E01..E09 each receive an independent "
+            "GOOD bank and an independent threshold. No test NG images are used for training."
         )
     )
     parser.add_argument("--train-good", required=True)
@@ -183,6 +169,12 @@ def main() -> None:
     parser.add_argument("--radial-bins", type=int, default=10)
     parser.add_argument("--hist-bins", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--threshold-profile",
+        choices=sorted(THRESHOLD_PROFILES),
+        default="recommended",
+        help="Threshold set written as the active threshold for every slot. Default: recommended.",
+    )
     args = parser.parse_args()
 
     train_root = Path(args.train_good).resolve()
@@ -205,28 +197,29 @@ def main() -> None:
         hist_bins=max(8, int(args.hist_bins)),
     )
     top_k = max(1, int(args.top_k))
+    threshold_profile = str(args.threshold_profile)
     align_cfg = ProductLocatorConfig(
         ecc_accept_score=float(args.ecc_accept),
         feature_min_inlier_ratio=float(args.min_inlier_ratio),
         canonical_scale=1.0,
     )
 
-    screw_rows: list[np.ndarray] = []
-    empty_rows: list[np.ndarray] = []
+    all_slots = s_slots + e_slots
+    slot_rows: dict[str, list[np.ndarray]] = {str(slot["id"]): [] for slot in all_slots}
     files = collect_images(train_root)
     if not files:
         raise SystemExit(f"No training images found under: {train_root}")
 
     skipped: list[dict] = []
     alignment_ok = 0
-    print("=== Build S/E dual-class GOOD-only models v3 ===")
-    print(f"Train GOOD:      {train_root}")
-    print(f"Canonical:       {canonical_w}x{canonical_h}")
-    print(f"S slots:         {[slot['id'] for slot in s_slots]}")
-    print(f"E slots:         {[slot['id'] for slot in e_slots]}")
-    print("Training:        S crops = real screw class; E crops = real empty class")
-    print("Test NG used:    NO")
-    print(f"Classifier:      dual-bank top-{top_k} cosine margin")
+    print("=== Build slot-wise S/E GOOD-only models v4 ===")
+    print(f"Train GOOD:        {train_root}")
+    print(f"Canonical:         {canonical_w}x{canonical_h}")
+    print(f"S slots:           {[slot['id'] for slot in s_slots]}")
+    print(f"E slots:           {[slot['id'] for slot in e_slots]}")
+    print("Model rule:        one slot = one bank = one threshold")
+    print(f"Threshold profile: {threshold_profile}")
+    print("Test NG used:      NO")
     print()
 
     for index, path in enumerate(files, 1):
@@ -234,88 +227,106 @@ def main() -> None:
             raw = read_image(path)
             alignment = align_to_reference(raw, reference, align_cfg)
             canonical = alignment.aligned
-            for slot in s_slots:
+            for slot in all_slots:
+                slot_id = str(slot["id"])
                 roi = roi_for_image(slot["roi"], config, canonical_w, canonical_h)
-                screw_rows.append(appearance_descriptor(crop_roi(canonical, roi), descriptor_cfg))
-            for slot in e_slots:
-                roi = roi_for_image(slot["roi"], config, canonical_w, canonical_h)
-                empty_rows.append(appearance_descriptor(crop_roi(canonical, roi), descriptor_cfg))
+                descriptor = appearance_descriptor(crop_roi(canonical, roi), descriptor_cfg)
+                slot_rows[slot_id].append(descriptor)
             alignment_ok += 1
             print(f"[{index}/{len(files)}] {path.name} -> OK | ecc={alignment.ecc_score:.4f}")
         except Exception as exc:
             skipped.append({"path": str(path), "error": str(exc)})
             print(f"[{index}/{len(files)}] {path.name} -> SKIP | {exc}")
 
-    if len(screw_rows) < 4 or len(empty_rows) < 4:
-        raise RuntimeError("Not enough aligned screw/empty samples to build S/E models.")
+    slot_banks: dict[str, np.ndarray] = {}
+    for slot_id, rows in slot_rows.items():
+        if len(rows) < 3:
+            raise RuntimeError(f"Not enough aligned GOOD samples for {slot_id}: {len(rows)}")
+        slot_banks[slot_id] = np.stack(rows).astype(np.float32)
 
-    screw_bank = np.stack(screw_rows).astype(np.float32)
-    empty_bank = np.stack(empty_rows).astype(np.float32)
-    s_threshold, e_threshold, calibration = _calibrate_thresholds(screw_bank, empty_bank, top_k)
-
-    s_model = _save_model(
+    s_ids = {str(slot["id"]) for slot in s_slots}
+    e_ids = {str(slot["id"]) for slot in e_slots}
+    s_model = _save_group_model(
         output / "S",
         expected="screw",
         detector_name="S_presence",
-        threshold=s_threshold,
-        screw_bank=screw_bank,
-        empty_bank=empty_bank,
+        slot_banks={slot_id: bank for slot_id, bank in slot_banks.items() if slot_id in s_ids},
         config=config,
         canonical_size=(canonical_w, canonical_h),
         descriptor_cfg=descriptor_cfg,
         top_k=top_k,
+        threshold_profile=threshold_profile,
         images_seen=len(files),
         alignment_ok=alignment_ok,
         skipped=skipped,
-        calibration_stats=calibration,
     )
-    e_model = _save_model(
+    e_model = _save_group_model(
         output / "E",
         expected="empty",
         detector_name="E_empty",
-        threshold=e_threshold,
-        screw_bank=screw_bank,
-        empty_bank=empty_bank,
+        slot_banks={slot_id: bank for slot_id, bank in slot_banks.items() if slot_id in e_ids},
         config=config,
         canonical_size=(canonical_w, canonical_h),
         descriptor_cfg=descriptor_cfg,
         top_k=top_k,
+        threshold_profile=threshold_profile,
         images_seen=len(files),
         alignment_ok=alignment_ok,
         skipped=skipped,
-        calibration_stats=calibration,
     )
 
+    summary_slots: dict[str, dict] = {}
+    for model in (s_model, e_model):
+        for slot_id, row in model["slots"].items():
+            summary_slots[slot_id] = {
+                "active_threshold": row["threshold"],
+                "profile": row["threshold_profile"],
+                "suggested_thresholds": row["suggested_thresholds"],
+                "good_distance": row["calibration"]["good_distance"],
+            }
+
     summary = {
-        "schema_version": 3,
-        "descriptor": "radial_presence_v3",
-        "classifier": "dual_bank_topk_cosine",
+        "schema_version": 4,
+        "descriptor": "slotwise_radial_v4",
+        "classifier": "slotwise_good_topk_cosine",
+        "threshold_profile": threshold_profile,
         "images_seen": len(files),
         "alignment_ok": alignment_ok,
         "alignment_skipped": len(files) - alignment_ok,
-        "screw_samples": int(screw_bank.shape[0]),
-        "empty_samples": int(empty_bank.shape[0]),
-        "S_threshold": float(s_model["classifier"]["threshold"]),
-        "E_threshold": float(e_model["classifier"]["threshold"]),
-        "calibration": calibration,
+        "slots": summary_slots,
         "S_model": str(output / "S" / "model.json"),
         "E_model": str(output / "E" / "model.json"),
     }
     (output / "build_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print()
+    print("=== Suggested thresholds by slot ===")
+    print("slot   good_max    strict      recommended   loose        active")
+    for slot_id in [str(slot["id"]) for slot in all_slots]:
+        row = summary_slots[slot_id]
+        suggestions = row["suggested_thresholds"]
+        good_max = row["good_distance"]["max"]
+        print(
+            f"{slot_id:<5}  {good_max:>9.6f}  {suggestions['strict']:>10.6f}  "
+            f"{suggestions['recommended']:>12.6f}  {suggestions['loose']:>10.6f}  "
+            f"{row['active_threshold']:>10.6f}"
+        )
+
+    print()
     print("=== Build Summary ===")
     print(f"GOOD images:       {len(files)}")
     print(f"Alignment OK:      {alignment_ok}")
     print(f"Alignment skipped: {len(files) - alignment_ok}")
-    print(f"Screw samples:     {screw_bank.shape[0]}")
-    print(f"Empty samples:     {empty_bank.shape[0]}")
-    print(f"Calibration:       {calibration['calibration']}")
-    print(f"S threshold:       {s_threshold:.6f}")
-    print(f"E threshold:       {e_threshold:.6f}")
+    print(f"Threshold profile: {threshold_profile}")
     print(f"S model:           {output / 'S' / 'model.json'}")
     print(f"E model:           {output / 'E' / 'model.json'}")
     print(f"Summary:           {output / 'build_summary.json'}")
+    print()
+    print("Threshold guidance:")
+    print("  strict      -> use if missing/extra screw defects are being missed; false alarms may increase")
+    print("  recommended -> default starting point for production tuning")
+    print("  loose       -> use only if GOOD false alarms remain after checking alignment/ROI quality")
+    print("You can later edit only one slot's threshold in model.json without changing the other 10 slots.")
 
 
 if __name__ == "__main__":
