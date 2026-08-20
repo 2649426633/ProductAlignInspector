@@ -133,14 +133,47 @@ def appearance_descriptor(
     return vector
 
 
-def topk_cosine_distance(vector: np.ndarray, bank: np.ndarray, top_k: int = 5) -> float:
+def circular_angle_distance_deg(a: float | np.ndarray, b: float | np.ndarray) -> np.ndarray:
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    return np.abs((aa - bb + 180.0) % 360.0 - 180.0)
+
+
+def angle_conditioned_topk_distance(
+    vector: np.ndarray,
+    bank: np.ndarray,
+    bank_angles_deg: np.ndarray,
+    query_angle_deg: float,
+    *,
+    top_k: int = 5,
+    angle_neighbors: int = 12,
+) -> tuple[float, int, float, float]:
     vector = np.asarray(vector, dtype=np.float32).reshape(-1)
     bank = np.asarray(bank, dtype=np.float32)
+    angles = np.asarray(bank_angles_deg, dtype=np.float32).reshape(-1)
     if bank.ndim != 2 or bank.shape[0] == 0 or bank.shape[1] != vector.shape[0]:
         raise ValueError(f"Invalid bank shape {bank.shape} for descriptor {vector.shape}")
-    distances = 1.0 - bank @ vector
+    if angles.size != bank.shape[0]:
+        raise ValueError(f"Angle count {angles.size} does not match bank rows {bank.shape[0]}")
+
+    angle_diff = circular_angle_distance_deg(angles, float(query_angle_deg)).reshape(-1)
+    n_angle = max(int(top_k), min(max(1, int(angle_neighbors)), bank.shape[0]))
+    candidate_idx = np.argpartition(angle_diff, n_angle - 1)[:n_angle]
+    candidate_bank = bank[candidate_idx]
+    candidate_diff = angle_diff[candidate_idx]
+
+    distances = 1.0 - candidate_bank @ vector
     k = max(1, min(int(top_k), distances.size))
-    return float(np.mean(np.partition(distances, k - 1)[:k]))
+    score = float(np.mean(np.partition(distances, k - 1)[:k]))
+    return score, int(candidate_idx.size), float(np.min(candidate_diff)), float(np.max(candidate_diff))
+
+
+def _runtime_rotation_deg(context: dict[str, Any]) -> float:
+    alignment = context.get("alignment") or {}
+    angle = alignment.get("rigid_rotation_deg")
+    if angle is None:
+        raise RuntimeError("S/E detector requires alignment.rigid_rotation_deg for angle-conditioned scoring.")
+    return float(angle)
 
 
 class _BasePresenceDetector:
@@ -156,7 +189,7 @@ class _BasePresenceDetector:
             raise FileNotFoundError(f"Presence model not found: {model_path}")
 
         self.model = json.loads(model_path.read_text(encoding="utf-8"))
-        if int(self.model.get("schema_version", 0)) != 4:
+        if int(self.model.get("schema_version", 0)) != 5:
             raise RuntimeError(
                 f"{self.name}: old/incompatible S/E model. Rebuild with tools/build_se_presence_models.py."
             )
@@ -164,7 +197,7 @@ class _BasePresenceDetector:
             raise ValueError(f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}")
 
         descriptor_cfg = self.model.get("descriptor") or {}
-        if str(descriptor_cfg.get("type", "")) != "slotwise_radial_v4":
+        if str(descriptor_cfg.get("type", "")) != "slotwise_radial_v5":
             raise RuntimeError(f"{self.name}: unsupported descriptor type {descriptor_cfg.get('type')}")
 
         canonical_size = self.model.get("canonical_size")
@@ -177,6 +210,7 @@ class _BasePresenceDetector:
         )
         classifier = self.model.get("classifier") or {}
         self.default_top_k = int(classifier.get("top_k", 5))
+        self.default_angle_neighbors = int(classifier.get("angle_neighbors", 12))
         self.threshold_profile = str(classifier.get("threshold_profile", "recommended"))
 
         slot_models = self.model.get("slots") or {}
@@ -185,14 +219,19 @@ class _BasePresenceDetector:
 
         self.slot_models: dict[str, dict[str, Any]] = {}
         for slot_id, row in slot_models.items():
-            bank_rel = str(row.get("bank", f"banks/{slot_id}.npy"))
+            bank_rel = str(row.get("bank", f"banks/{slot_id}.npz"))
             bank_path = self.model_dir / bank_rel
             if not bank_path.exists():
                 raise FileNotFoundError(f"{self.name}: bank not found for {slot_id}: {bank_path}")
+            with np.load(bank_path) as data:
+                descriptors = np.asarray(data["descriptors"], dtype=np.float32)
+                angles_deg = np.asarray(data["angles_deg"], dtype=np.float32)
             self.slot_models[str(slot_id)] = {
-                "bank": np.load(bank_path).astype(np.float32),
+                "bank": descriptors,
+                "angles_deg": angles_deg,
                 "threshold": float(row["threshold"]),
                 "top_k": int(row.get("top_k", self.default_top_k)),
+                "angle_neighbors": int(row.get("angle_neighbors", self.default_angle_neighbors)),
                 "suggested_thresholds": row.get("suggested_thresholds") or {},
                 "calibration": row.get("calibration") or {},
             }
@@ -204,6 +243,7 @@ class _BasePresenceDetector:
                 f"{self.name}: model canonical size={self.canonical_size[0]}x{self.canonical_size[1]}, runtime={w}x{h}"
             )
 
+        query_angle = _runtime_rotation_deg(context)
         rows: list[dict[str, Any]] = []
         any_ng = False
         for slot in enabled_slots(self.config, expected=self.expected):
@@ -214,7 +254,14 @@ class _BasePresenceDetector:
 
             roi = roi_for_image(slot["roi"], self.config, w, h)
             descriptor = appearance_descriptor(crop_roi(canonical_bgr, roi), self.descriptor_cfg)
-            score = topk_cosine_distance(descriptor, model["bank"], model["top_k"])
+            score, candidate_count, min_angle_diff, max_angle_diff = angle_conditioned_topk_distance(
+                descriptor,
+                model["bank"],
+                model["angles_deg"],
+                query_angle,
+                top_k=model["top_k"],
+                angle_neighbors=model["angle_neighbors"],
+            )
             threshold = float(model["threshold"])
             passed = score <= threshold
             status = "PASS" if passed else "NG"
@@ -230,7 +277,12 @@ class _BasePresenceDetector:
                     "threshold": threshold,
                     "threshold_profile": self.threshold_profile,
                     "suggested_thresholds": model["suggested_thresholds"],
-                    "decision": "score <= slot_threshold",
+                    "decision": "angle-conditioned score <= slot_threshold",
+                    "rotation_deg": float(query_angle),
+                    "angle_neighbors": int(model["angle_neighbors"]),
+                    "candidate_count": int(candidate_count),
+                    "min_training_angle_diff_deg": float(min_angle_diff),
+                    "max_selected_angle_diff_deg": float(max_angle_diff),
                     "roi_canonical": roi,
                 }
             )
