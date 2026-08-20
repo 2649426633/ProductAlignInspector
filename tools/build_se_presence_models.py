@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,11 +15,7 @@ if str(ROOT) not in sys.path:
 from product_align_inspector.alignment import ProductLocatorConfig, align_to_reference
 from product_align_inspector.io_utils import read_image
 from product_align_inspector.roi import config_reference_size, crop_roi, enabled_slots, roi_for_image
-from product_align_inspector.se_presence import (
-    PresenceDescriptorConfig,
-    appearance_descriptor,
-    circular_angle_distance_deg,
-)
+from product_align_inspector.se_presence import PresenceDescriptorConfig, appearance_descriptor
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 THRESHOLD_PROFILES = {"strict", "recommended", "loose"}
@@ -28,77 +25,81 @@ def collect_images(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
 
 
-def _angle_conditioned_distance(
+def _gamma_variant(image: np.ndarray, gamma: float) -> np.ndarray:
+    x = np.asarray(image, dtype=np.float32) / 255.0
+    y = np.power(np.clip(x, 0.0, 1.0), float(gamma))
+    return np.clip(y * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _gradient_variant(image: np.ndarray, axis: int, reverse: bool, strength: float = 0.35) -> np.ndarray:
+    h, w = image.shape[:2]
+    if axis == 0:
+        ramp = np.linspace(1.0 - strength, 1.0 + strength, h, dtype=np.float32)[:, None]
+        ramp = np.repeat(ramp, w, axis=1)
+    else:
+        ramp = np.linspace(1.0 - strength, 1.0 + strength, w, dtype=np.float32)[None, :]
+        ramp = np.repeat(ramp, h, axis=0)
+    if reverse:
+        ramp = np.flip(ramp, axis=axis)
+    if image.ndim == 3:
+        ramp = ramp[..., None]
+    return np.clip(np.asarray(image, dtype=np.float32) * ramp, 0.0, 255.0).astype(np.uint8)
+
+
+def _lighting_variants(crop: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Training-only illumination augmentation; geometry is never changed."""
+    return [
+        ("identity", crop),
+        ("gamma_065", _gamma_variant(crop, 0.65)),
+        ("gamma_080", _gamma_variant(crop, 0.80)),
+        ("gamma_125", _gamma_variant(crop, 1.25)),
+        ("gamma_155", _gamma_variant(crop, 1.55)),
+        ("shade_left_right", _gradient_variant(crop, axis=1, reverse=False)),
+        ("shade_right_left", _gradient_variant(crop, axis=1, reverse=True)),
+        ("shade_top_bottom", _gradient_variant(crop, axis=0, reverse=False)),
+        ("shade_bottom_top", _gradient_variant(crop, axis=0, reverse=True)),
+    ]
+
+
+def _topk_distance_excluding_group(
     vector: np.ndarray,
     bank: np.ndarray,
-    angles_deg: np.ndarray,
-    query_angle_deg: float,
-    *,
+    groups: np.ndarray,
+    group_id: int,
     top_k: int,
-    angle_neighbors: int,
-    exclude: int | None = None,
-) -> tuple[float, float]:
+) -> float:
     bank = np.asarray(bank, dtype=np.float32)
-    angles = np.asarray(angles_deg, dtype=np.float32).reshape(-1)
-    if bank.ndim != 2 or bank.shape[0] != angles.size:
-        raise RuntimeError(f"Invalid calibration bank/angle shapes: bank={bank.shape}, angles={angles.shape}")
+    groups = np.asarray(groups, dtype=np.int32).reshape(-1)
+    if bank.ndim != 2 or bank.shape[0] != groups.size:
+        raise RuntimeError(f"Invalid bank/group shapes: bank={bank.shape}, groups={groups.shape}")
 
-    angle_diff = circular_angle_distance_deg(angles, float(query_angle_deg)).reshape(-1)
-    valid = np.ones(bank.shape[0], dtype=bool)
-    if exclude is not None and 0 <= exclude < bank.shape[0]:
-        valid[exclude] = False
-    valid_idx = np.flatnonzero(valid)
-    if valid_idx.size == 0:
-        raise RuntimeError("No GOOD neighbors available for slot calibration.")
+    valid = groups != int(group_id)
+    candidate = bank[valid]
+    if candidate.shape[0] == 0:
+        raise RuntimeError("No other GOOD image is available for slot calibration.")
 
-    n_angle = max(int(top_k), min(max(1, int(angle_neighbors)), valid_idx.size))
-    valid_diff = angle_diff[valid_idx]
-    local = np.argpartition(valid_diff, n_angle - 1)[:n_angle]
-    candidate_idx = valid_idx[local]
-
-    distances = 1.0 - bank[candidate_idx] @ np.asarray(vector, dtype=np.float32)
+    distances = 1.0 - candidate @ np.asarray(vector, dtype=np.float32)
     k = max(1, min(int(top_k), distances.size))
-    score = float(np.mean(np.partition(distances, k - 1)[:k]))
-    max_angle_diff = float(np.max(angle_diff[candidate_idx]))
-    return score, max_angle_diff
-
-
-def _largest_circular_gap_deg(angles_deg: np.ndarray) -> float:
-    angles = np.mod(np.asarray(angles_deg, dtype=np.float32).reshape(-1), 360.0)
-    if angles.size < 2:
-        return 360.0
-    ordered = np.sort(angles)
-    gaps = np.diff(np.concatenate([ordered, [ordered[0] + 360.0]]))
-    return float(np.max(gaps))
+    return float(np.mean(np.partition(distances, k - 1)[:k]))
 
 
 def _slot_calibration(
-    bank: np.ndarray,
-    angles_deg: np.ndarray,
+    original_vectors: np.ndarray,
+    augmented_bank: np.ndarray,
+    groups: np.ndarray,
     *,
     top_k: int,
-    angle_neighbors: int,
 ) -> dict:
-    if bank.ndim != 2 or bank.shape[0] < 3:
-        raise RuntimeError(f"Not enough GOOD samples for slot calibration: {bank.shape}")
+    if original_vectors.ndim != 2 or original_vectors.shape[0] < 3:
+        raise RuntimeError(f"Not enough GOOD samples for slot calibration: {original_vectors.shape}")
 
-    distances: list[float] = []
-    selected_angle_spans: list[float] = []
-    for i, vector in enumerate(bank):
-        score, max_angle_diff = _angle_conditioned_distance(
-            vector,
-            bank,
-            angles_deg,
-            float(angles_deg[i]),
-            top_k=top_k,
-            angle_neighbors=angle_neighbors,
-            exclude=i,
-        )
-        distances.append(score)
-        selected_angle_spans.append(max_angle_diff)
-
-    values = np.asarray(distances, dtype=np.float32)
-    angle_spans = np.asarray(selected_angle_spans, dtype=np.float32)
+    values = np.asarray(
+        [
+            _topk_distance_excluding_group(vector, augmented_bank, groups, i, top_k)
+            for i, vector in enumerate(original_vectors)
+        ],
+        dtype=np.float32,
+    )
 
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
@@ -107,20 +108,17 @@ def _slot_calibration(
     p99 = float(np.quantile(values, 0.99))
     max_good = float(np.max(values))
 
+    # Per-slot recommendations. "recommended" deliberately leaves a margin over
+    # the worst leave-one-image-out GOOD sample without using any test image.
     strict = max(max_good * 1.05 + 0.001, p99 + 0.001)
     recommended = max(max_good * 1.15 + 0.002, median + 6.0 * robust_sigma)
     loose = max(max_good * 1.30 + 0.004, median + 8.0 * robust_sigma)
 
     return {
-        "samples": int(bank.shape[0]),
-        "descriptor_dim": int(bank.shape[1]),
+        "base_samples": int(original_vectors.shape[0]),
+        "bank_rows": int(augmented_bank.shape[0]),
+        "descriptor_dim": int(augmented_bank.shape[1]),
         "top_k": int(top_k),
-        "angle_neighbors": int(angle_neighbors),
-        "angle_coverage": {
-            "largest_gap_deg": _largest_circular_gap_deg(angles_deg),
-            "median_selected_span_deg": float(np.median(angle_spans)),
-            "max_selected_span_deg": float(np.max(angle_spans)),
-        },
         "good_distance": {
             "min": float(np.min(values)),
             "median": median,
@@ -144,17 +142,18 @@ def _save_group_model(
     *,
     expected: str,
     detector_name: str,
-    slot_banks: dict[str, np.ndarray],
-    slot_angles: dict[str, np.ndarray],
+    original_vectors: dict[str, np.ndarray],
+    augmented_banks: dict[str, np.ndarray],
+    group_ids: dict[str, np.ndarray],
     config: dict,
     canonical_size: tuple[int, int],
     descriptor_cfg: PresenceDescriptorConfig,
     top_k: int,
-    angle_neighbors: int,
     threshold_profile: str,
     images_seen: int,
     alignment_ok: int,
     skipped: list[dict],
+    augmentation_names: list[str],
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     banks_dir = output_dir / "banks"
@@ -164,27 +163,20 @@ def _save_group_model(
             old.unlink()
 
     slot_models: dict[str, dict] = {}
-    for slot_id, bank in slot_banks.items():
-        angles = slot_angles[slot_id]
+    for slot_id, bank in augmented_banks.items():
         calibration = _slot_calibration(
+            original_vectors[slot_id],
             bank,
-            angles,
+            group_ids[slot_id],
             top_k=top_k,
-            angle_neighbors=angle_neighbors,
         )
         suggestions = calibration["suggested_thresholds"]
         threshold = float(suggestions[threshold_profile])
-
-        bank_rel = f"banks/{slot_id}.npz"
-        np.savez_compressed(
-            output_dir / bank_rel,
-            descriptors=bank.astype(np.float32),
-            angles_deg=angles.astype(np.float32),
-        )
+        bank_rel = f"banks/{slot_id}.npy"
+        np.save(output_dir / bank_rel, bank.astype(np.float32))
         slot_models[slot_id] = {
             "bank": bank_rel,
             "top_k": int(top_k),
-            "angle_neighbors": int(angle_neighbors),
             "threshold": threshold,
             "threshold_profile": threshold_profile,
             "suggested_thresholds": suggestions,
@@ -193,35 +185,34 @@ def _save_group_model(
 
     roi_size = config_reference_size(config)
     model = {
-        "schema_version": 5,
+        "schema_version": 6,
         "detector": detector_name,
         "expected": expected,
         "canonical_size": [int(canonical_size[0]), int(canonical_size[1])],
         "roi_coordinate_size": None if roi_size is None else [int(roi_size[0]), int(roi_size[1])],
         "descriptor": {
-            "type": "slotwise_radial_v5",
+            "type": "slotwise_structure_v6",
             "size": int(descriptor_cfg.size),
             "center_crop_ratio": float(descriptor_cfg.center_crop_ratio),
             "radial_bins": int(descriptor_cfg.radial_bins),
             "hist_bins": int(descriptor_cfg.hist_bins),
+            "note": "absolute brightness removed; local contrast + structure + LBP",
         },
         "classifier": {
-            "type": "slotwise_angle_conditioned_good_topk_cosine",
+            "type": "slotwise_augmented_good_topk_cosine",
             "top_k": int(top_k),
-            "angle_neighbors": int(angle_neighbors),
             "threshold_profile": threshold_profile,
-            "decision": "PASS when angle-conditioned score <= threshold stored for that exact slot",
+            "decision": "PASS when illumination-invariant score <= threshold for that exact slot",
         },
         "training": {
             "images_seen": int(images_seen),
             "alignment_ok": int(alignment_ok),
             "alignment_skipped": int(images_seen - alignment_ok),
             "skipped": skipped,
-            "source": (
-                "GOOD only; every S/E position has its own bank and one threshold. "
-                "Each bank also stores the product rotation angle so fixed-light reflection is compared "
-                "against GOOD samples captured at similar angles."
-            ),
+            "source": "GOOD only; every S/E position has its own bank and threshold",
+            "lighting_augmentation": augmentation_names,
+            "geometry_augmentation": "none",
+            "calibration": "leave one source image out, including all of its augmented copies",
         },
         "slots": slot_models,
     }
@@ -232,8 +223,8 @@ def _save_group_model(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build slot-wise S/E GOOD-only models with angle-conditioned scoring. "
-            "S01/S02 and E01..E09 each keep one independent threshold; test NG is never used."
+            "Build v6 slot-wise S/E GOOD-only models. Every position keeps one independent bank and "
+            "one independent threshold. Training uses photometric augmentation only; test NG images are never used."
         )
     )
     parser.add_argument("--train-good", required=True)
@@ -243,21 +234,15 @@ def main() -> None:
     parser.add_argument("--ecc-accept", type=float, default=0.70)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.10)
     parser.add_argument("--descriptor-size", type=int, default=64)
-    parser.add_argument("--center-crop-ratio", type=float, default=0.78)
+    parser.add_argument("--center-crop-ratio", type=float, default=0.72)
     parser.add_argument("--radial-bins", type=int, default=10)
     parser.add_argument("--hist-bins", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
-        "--angle-neighbors",
-        type=int,
-        default=12,
-        help="How many GOOD samples with the nearest physical rotation angles are eligible per slot. Default: 12.",
-    )
-    parser.add_argument(
         "--threshold-profile",
         choices=sorted(THRESHOLD_PROFILES),
         default="recommended",
-        help="Threshold set written as the active threshold for every slot. Default: recommended.",
+        help="Active threshold profile written for each independent slot. Default: recommended.",
     )
     args = parser.parse_args()
 
@@ -281,9 +266,7 @@ def main() -> None:
         hist_bins=max(8, int(args.hist_bins)),
     )
     top_k = max(1, int(args.top_k))
-    angle_neighbors = max(top_k, int(args.angle_neighbors))
     threshold_profile = str(args.threshold_profile)
-
     align_cfg = ProductLocatorConfig(
         ecc_accept_score=float(args.ecc_accept),
         feature_min_inlier_ratio=float(args.min_inlier_ratio),
@@ -291,8 +274,9 @@ def main() -> None:
     )
 
     all_slots = s_slots + e_slots
-    slot_rows: dict[str, list[np.ndarray]] = {str(slot["id"]): [] for slot in all_slots}
-    slot_angle_rows: dict[str, list[float]] = {str(slot["id"]): [] for slot in all_slots}
+    original_rows: dict[str, list[np.ndarray]] = {str(slot["id"]): [] for slot in all_slots}
+    augmented_rows: dict[str, list[np.ndarray]] = {str(slot["id"]): [] for slot in all_slots}
+    group_rows: dict[str, list[int]] = {str(slot["id"]): [] for slot in all_slots}
 
     files = collect_images(train_root)
     if not files:
@@ -300,52 +284,60 @@ def main() -> None:
 
     skipped: list[dict] = []
     alignment_ok = 0
-    all_angles: list[float] = []
+    augmentation_names: list[str] | None = None
 
-    print("=== Build slot-wise angle-conditioned S/E models v5 ===")
+    print("=== Build slot-wise illumination-robust S/E models v6 ===")
     print(f"Train GOOD:        {train_root}")
     print(f"Canonical:         {canonical_w}x{canonical_h}")
     print(f"S slots:           {[slot['id'] for slot in s_slots]}")
     print(f"E slots:           {[slot['id'] for slot in e_slots]}")
     print("Model rule:        one slot = one bank = one threshold")
-    print(f"Angle neighbors:   {angle_neighbors}")
+    print("Descriptor:        local-contrast structure + rotation-invariant LBP")
+    print("Lighting augment:  gamma + smooth directional shading")
+    print("Geometry augment:  NONE")
     print(f"Threshold profile: {threshold_profile}")
     print("Test NG used:      NO")
     print()
 
-    for index, path in enumerate(files, 1):
+    for source_index, path in enumerate(files):
+        index = source_index + 1
         try:
             raw = read_image(path)
             alignment = align_to_reference(raw, reference, align_cfg)
             canonical = alignment.aligned
-            if alignment.rigid_rotation_deg is None:
-                raise RuntimeError("Alignment rotation is missing.")
-            angle = float(alignment.rigid_rotation_deg)
 
             for slot in all_slots:
                 slot_id = str(slot["id"])
                 roi = roi_for_image(slot["roi"], config, canonical_w, canonical_h)
-                descriptor = appearance_descriptor(crop_roi(canonical, roi), descriptor_cfg)
-                slot_rows[slot_id].append(descriptor)
-                slot_angle_rows[slot_id].append(angle)
+                crop = crop_roi(canonical, roi)
+                variants = _lighting_variants(crop)
+                if augmentation_names is None:
+                    augmentation_names = [name for name, _ in variants]
 
-            all_angles.append(angle)
+                original_rows[slot_id].append(appearance_descriptor(crop, descriptor_cfg))
+                for _, variant in variants:
+                    augmented_rows[slot_id].append(appearance_descriptor(variant, descriptor_cfg))
+                    group_rows[slot_id].append(source_index)
+
             alignment_ok += 1
-            print(
-                f"[{index}/{len(files)}] {path.name} -> OK | "
-                f"rot={angle:8.3f} | ecc={alignment.ecc_score:.4f}"
-            )
+            print(f"[{index}/{len(files)}] {path.name} -> OK | ecc={alignment.ecc_score:.4f}")
         except Exception as exc:
             skipped.append({"path": str(path), "error": str(exc)})
             print(f"[{index}/{len(files)}] {path.name} -> SKIP | {exc}")
 
-    slot_banks: dict[str, np.ndarray] = {}
-    slot_angles: dict[str, np.ndarray] = {}
-    for slot_id, rows in slot_rows.items():
-        if len(rows) < 3:
-            raise RuntimeError(f"Not enough aligned GOOD samples for {slot_id}: {len(rows)}")
-        slot_banks[slot_id] = np.stack(rows).astype(np.float32)
-        slot_angles[slot_id] = np.asarray(slot_angle_rows[slot_id], dtype=np.float32)
+    originals: dict[str, np.ndarray] = {}
+    banks: dict[str, np.ndarray] = {}
+    groups: dict[str, np.ndarray] = {}
+    for slot in all_slots:
+        slot_id = str(slot["id"])
+        if len(original_rows[slot_id]) < 3:
+            raise RuntimeError(f"Not enough aligned GOOD samples for {slot_id}: {len(original_rows[slot_id])}")
+        originals[slot_id] = np.stack(original_rows[slot_id]).astype(np.float32)
+        banks[slot_id] = np.stack(augmented_rows[slot_id]).astype(np.float32)
+        groups[slot_id] = np.asarray(group_rows[slot_id], dtype=np.int32)
+
+    if augmentation_names is None:
+        raise RuntimeError("No augmentation variants were generated.")
 
     s_ids = {str(slot["id"]) for slot in s_slots}
     e_ids = {str(slot["id"]) for slot in e_slots}
@@ -354,33 +346,35 @@ def main() -> None:
         output / "S",
         expected="screw",
         detector_name="S_presence",
-        slot_banks={slot_id: bank for slot_id, bank in slot_banks.items() if slot_id in s_ids},
-        slot_angles={slot_id: angles for slot_id, angles in slot_angles.items() if slot_id in s_ids},
+        original_vectors={k: v for k, v in originals.items() if k in s_ids},
+        augmented_banks={k: v for k, v in banks.items() if k in s_ids},
+        group_ids={k: v for k, v in groups.items() if k in s_ids},
         config=config,
         canonical_size=(canonical_w, canonical_h),
         descriptor_cfg=descriptor_cfg,
         top_k=top_k,
-        angle_neighbors=angle_neighbors,
         threshold_profile=threshold_profile,
         images_seen=len(files),
         alignment_ok=alignment_ok,
         skipped=skipped,
+        augmentation_names=augmentation_names,
     )
     e_model = _save_group_model(
         output / "E",
         expected="empty",
         detector_name="E_empty",
-        slot_banks={slot_id: bank for slot_id, bank in slot_banks.items() if slot_id in e_ids},
-        slot_angles={slot_id: angles for slot_id, angles in slot_angles.items() if slot_id in e_ids},
+        original_vectors={k: v for k, v in originals.items() if k in e_ids},
+        augmented_banks={k: v for k, v in banks.items() if k in e_ids},
+        group_ids={k: v for k, v in groups.items() if k in e_ids},
         config=config,
         canonical_size=(canonical_w, canonical_h),
         descriptor_cfg=descriptor_cfg,
         top_k=top_k,
-        angle_neighbors=angle_neighbors,
         threshold_profile=threshold_profile,
         images_seen=len(files),
         alignment_ok=alignment_ok,
         skipped=skipped,
+        augmentation_names=augmentation_names,
     )
 
     summary_slots: dict[str, dict] = {}
@@ -391,21 +385,19 @@ def main() -> None:
                 "profile": row["threshold_profile"],
                 "suggested_thresholds": row["suggested_thresholds"],
                 "good_distance": row["calibration"]["good_distance"],
-                "angle_coverage": row["calibration"]["angle_coverage"],
+                "base_samples": row["calibration"]["base_samples"],
+                "bank_rows": row["calibration"]["bank_rows"],
             }
 
-    training_angles = np.asarray(all_angles, dtype=np.float32)
     summary = {
-        "schema_version": 5,
-        "descriptor": "slotwise_radial_v5",
-        "classifier": "slotwise_angle_conditioned_good_topk_cosine",
+        "schema_version": 6,
+        "descriptor": "slotwise_structure_v6",
+        "classifier": "slotwise_augmented_good_topk_cosine",
         "threshold_profile": threshold_profile,
-        "top_k": top_k,
-        "angle_neighbors": angle_neighbors,
         "images_seen": len(files),
         "alignment_ok": alignment_ok,
         "alignment_skipped": len(files) - alignment_ok,
-        "training_angle_largest_gap_deg": _largest_circular_gap_deg(training_angles),
+        "lighting_augmentation": augmentation_names,
         "slots": summary_slots,
         "S_model": str(output / "S" / "model.json"),
         "E_model": str(output / "E" / "model.json"),
@@ -414,16 +406,15 @@ def main() -> None:
 
     print()
     print("=== Suggested thresholds by slot ===")
-    print("slot   good_max    strict      recommended   loose        active       angle_gap")
+    print("slot   good_max    strict      recommended   loose        active      bank")
     for slot_id in [str(slot["id"]) for slot in all_slots]:
         row = summary_slots[slot_id]
         suggestions = row["suggested_thresholds"]
         good_max = row["good_distance"]["max"]
-        angle_gap = row["angle_coverage"]["largest_gap_deg"]
         print(
             f"{slot_id:<5}  {good_max:>9.6f}  {suggestions['strict']:>10.6f}  "
             f"{suggestions['recommended']:>12.6f}  {suggestions['loose']:>10.6f}  "
-            f"{row['active_threshold']:>10.6f}  {angle_gap:>9.3f}"
+            f"{row['active_threshold']:>10.6f}  {row['bank_rows']:>5d}"
         )
 
     print()
@@ -431,18 +422,17 @@ def main() -> None:
     print(f"GOOD images:       {len(files)}")
     print(f"Alignment OK:      {alignment_ok}")
     print(f"Alignment skipped: {len(files) - alignment_ok}")
-    print(f"Angle neighbors:   {angle_neighbors}")
-    print(f"Largest angle gap: {_largest_circular_gap_deg(training_angles):.3f} deg")
+    print(f"Augmentations:     {len(augmentation_names)} per GOOD ROI")
     print(f"Threshold profile: {threshold_profile}")
     print(f"S model:           {output / 'S' / 'model.json'}")
     print(f"E model:           {output / 'E' / 'model.json'}")
     print(f"Summary:           {output / 'build_summary.json'}")
     print()
     print("Threshold guidance:")
-    print("  strict      -> catches smaller deviations; false alarms may increase")
-    print("  recommended -> default production starting point")
-    print("  loose       -> only for a slot that still has GOOD false alarms after checking angle coverage")
-    print("Keep one independent threshold per slot. Do not raise a threshold just to absorb a large lighting-angle mismatch.")
+    print("  strict      -> more sensitive, more GOOD false-alarm risk")
+    print("  recommended -> default starting point")
+    print("  loose       -> only after NG recall is verified")
+    print("Each S/E slot still has one independent threshold in model.json.")
 
 
 if __name__ == "__main__":
