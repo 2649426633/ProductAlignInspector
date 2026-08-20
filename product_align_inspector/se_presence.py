@@ -14,14 +14,6 @@ from .roi import crop_roi, enabled_slots, roi_for_image
 
 @dataclass
 class PresenceDescriptorConfig:
-    """Descriptor tuned for circular screw/empty-hole ROIs.
-
-    The old v1 descriptor flattened the ROI pixels, so a physically rotated part
-    could change the lighting direction inside the ROI and produce a very large
-    distance even after geometric alignment. v2 deliberately removes angular
-    information and keeps radial/structural statistics instead.
-    """
-
     size: int = 64
     center_crop_ratio: float = 0.78
     radial_bins: int = 10
@@ -38,8 +30,7 @@ def _gray_uint8(image: np.ndarray) -> np.ndarray:
 def _center_square(gray: np.ndarray, ratio: float) -> np.ndarray:
     h, w = gray.shape[:2]
     side = max(12, int(round(min(h, w) * float(np.clip(ratio, 0.45, 1.0)))))
-    cx = w // 2
-    cy = h // 2
+    cx, cy = w // 2, h // 2
     x0 = max(0, cx - side // 2)
     y0 = max(0, cy - side // 2)
     x1 = min(w, x0 + side)
@@ -54,7 +45,7 @@ def _normalize_01(values: np.ndarray, percentile: float = 95.0) -> np.ndarray:
     scale = float(np.percentile(np.abs(arr), percentile))
     if scale <= 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
-    return np.clip(arr / scale, 0.0, 1.0).astype(np.float32)
+    return np.clip(np.abs(arr) / scale, 0.0, 1.0).astype(np.float32)
 
 
 def _hist01(values: np.ndarray, bins: int) -> np.ndarray:
@@ -74,19 +65,7 @@ def appearance_descriptor(
     crop: np.ndarray,
     cfg: PresenceDescriptorConfig | None = None,
 ) -> np.ndarray:
-    """Return a local lighting/rotation-resistant S/E descriptor.
-
-    Main ideas:
-      * keep only the center of each ROI, where the screw/hole actually sits;
-      * CLAHE normalizes exposure differences;
-      * remove slowly varying illumination with a Gaussian high-pass;
-      * pool intensity/edge/texture statistics by radius instead of angle.
-
-    This makes a 180-degree physically rotated GOOD part much less likely to be
-    rejected merely because the light/shadow direction around a circular hole or
-    screw head changed.
-    """
-
+    """Rotation/lighting-resistant local descriptor for screw vs empty appearance."""
     cfg = cfg or PresenceDescriptorConfig()
     size = max(32, int(cfg.size))
     radial_bins = max(4, int(cfg.radial_bins))
@@ -97,19 +76,17 @@ def appearance_descriptor(
     gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     gray = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
 
-    # Remove low-frequency directional lighting while keeping the screw cross,
-    # hole rim, central cavity and other local structure.
     blur_k = max(5, int(round(size * 0.23)))
     if blur_k % 2 == 0:
         blur_k += 1
     low = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
     high = gray - low
-    high_abs = _normalize_01(np.abs(high), 95.0)
+    high_abs = _normalize_01(high)
 
     gx = cv2.Scharr(high, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(high, cv2.CV_32F, 0, 1)
-    grad = _normalize_01(cv2.magnitude(gx, gy), 95.0)
-    lap = _normalize_01(np.abs(cv2.Laplacian(high, cv2.CV_32F, ksize=3)), 95.0)
+    grad = _normalize_01(cv2.magnitude(gx, gy))
+    lap = _normalize_01(cv2.Laplacian(high, cv2.CV_32F, ksize=3))
 
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
     cx = (size - 1) * 0.5
@@ -119,7 +96,6 @@ def appearance_descriptor(
     disk = radius <= 1.0
 
     features: list[float] = []
-    # Angularly pooled radial statistics: deliberately rotation invariant.
     for i in range(radial_bins):
         r0 = i / radial_bins
         r1 = (i + 1) / radial_bins
@@ -137,17 +113,10 @@ def appearance_descriptor(
             ]
         )
 
-    # Global distributions inside the central disk. These retain the difference
-    # between a simple empty cavity and the richer texture of a screw head.
-    disk_gray = gray[disk]
-    disk_grad = grad[disk]
-    disk_lap = lap[disk]
-    features.extend(_hist01(disk_gray, hist_bins).tolist())
-    features.extend(_hist01(disk_grad, hist_bins).tolist())
-    features.extend(_hist01(disk_lap, hist_bins).tolist())
+    features.extend(_hist01(gray[disk], hist_bins).tolist())
+    features.extend(_hist01(grad[disk], hist_bins).tolist())
+    features.extend(_hist01(lap[disk], hist_bins).tolist())
 
-    # A few center-vs-ring contrasts are useful for distinguishing an empty dark
-    # hole from a metallic screw head, without relying on any particular angle.
     inner = disk & (radius <= 0.30)
     middle = disk & (radius >= 0.38) & (radius <= 0.68)
     outer = disk & (radius >= 0.68) & (radius <= 0.95)
@@ -164,35 +133,16 @@ def appearance_descriptor(
     return vector
 
 
-def nearest_cosine_distance(vector: np.ndarray, bank: np.ndarray) -> float:
-    vector = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+def topk_cosine_distance(vector: np.ndarray, bank: np.ndarray, top_k: int = 5) -> float:
+    vector = np.asarray(vector, dtype=np.float32).reshape(-1)
     bank = np.asarray(bank, dtype=np.float32)
-    if bank.ndim != 2 or bank.shape[1] != vector.shape[1] or bank.shape[0] == 0:
+    if bank.ndim != 2 or bank.shape[0] == 0 or bank.shape[1] != vector.shape[0]:
         raise ValueError(f"Invalid bank shape {bank.shape} for descriptor {vector.shape}")
-    similarity = bank @ vector[0]
-    return float(1.0 - float(np.max(similarity)))
-
-
-def leave_one_out_distances(bank: np.ndarray) -> np.ndarray:
-    bank = np.asarray(bank, dtype=np.float32)
-    if bank.ndim != 2 or bank.shape[0] < 2:
-        return np.zeros((bank.shape[0],), dtype=np.float32)
-    similarity = bank @ bank.T
-    np.fill_diagonal(similarity, -np.inf)
-    return (1.0 - np.max(similarity, axis=1)).astype(np.float32)
-
-
-def threshold_from_good(
-    distances: np.ndarray,
-    *,
-    margin_factor: float = 1.25,
-    margin_abs: float = 0.002,
-) -> float:
-    values = np.asarray(distances, dtype=np.float32).reshape(-1)
-    if values.size == 0:
-        return 0.05
-    base = max(float(np.max(values)), float(values.mean() + 4.0 * values.std()))
-    return max(0.005, base * float(margin_factor) + float(margin_abs))
+    similarity = bank @ vector
+    distances = 1.0 - similarity
+    k = max(1, min(int(top_k), distances.size))
+    nearest = np.partition(distances, k - 1)[:k]
+    return float(np.mean(nearest))
 
 
 class _BasePresenceDetector:
@@ -208,16 +158,12 @@ class _BasePresenceDetector:
             raise FileNotFoundError(f"Presence model not found: {model_path}")
         self.model = json.loads(model_path.read_text(encoding="utf-8"))
         if str(self.model.get("expected", "")).lower() != self.expected:
-            raise ValueError(
-                f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}"
-            )
+            raise ValueError(f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}")
 
         descriptor_cfg = self.model.get("descriptor") or {}
-        descriptor_type = str(descriptor_cfg.get("type", ""))
-        if descriptor_type != "radial_presence_v2":
+        if str(descriptor_cfg.get("type", "")) != "radial_presence_v3":
             raise RuntimeError(
-                f"{self.name}: old/incompatible S/E model. Rebuild models with "
-                "tools/build_se_presence_models.py."
+                f"{self.name}: old/incompatible S/E model. Rebuild with tools/build_se_presence_models.py."
             )
 
         canonical_size = self.model.get("canonical_size")
@@ -228,44 +174,53 @@ class _BasePresenceDetector:
             radial_bins=int(descriptor_cfg.get("radial_bins", 10)),
             hist_bins=int(descriptor_cfg.get("hist_bins", 16)),
         )
-        self.thresholds = {str(k): float(v) for k, v in (self.model.get("thresholds") or {}).items()}
-        self.banks: dict[str, np.ndarray] = {}
-        for slot_id in self.thresholds:
-            path = self.model_dir / "banks" / f"{slot_id}.npy"
-            if not path.exists():
-                raise FileNotFoundError(f"Presence bank not found: {path}")
-            self.banks[slot_id] = np.load(path).astype(np.float32)
+        classifier = self.model.get("classifier") or {}
+        self.top_k = int(classifier.get("top_k", 5))
+        self.threshold = float(classifier.get("threshold", 0.0))
+
+        screw_path = self.model_dir / "banks" / "screw.npy"
+        empty_path = self.model_dir / "banks" / "empty.npy"
+        if not screw_path.exists() or not empty_path.exists():
+            raise FileNotFoundError(f"{self.name}: screw/empty banks are missing in {self.model_dir / 'banks'}")
+        self.screw_bank = np.load(screw_path).astype(np.float32)
+        self.empty_bank = np.load(empty_path).astype(np.float32)
 
     def inspect(self, canonical_bgr: np.ndarray, context: dict[str, Any]) -> DetectionResult:
         h, w = canonical_bgr.shape[:2]
         if self.canonical_size is not None and self.canonical_size != (w, h):
             raise RuntimeError(
-                f"{self.name}: model canonical size={self.canonical_size[0]}x{self.canonical_size[1]}, "
-                f"runtime={w}x{h}"
+                f"{self.name}: model canonical size={self.canonical_size[0]}x{self.canonical_size[1]}, runtime={w}x{h}"
             )
 
-        slot_rows: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         any_ng = False
         for slot in enabled_slots(self.config, expected=self.expected):
-            slot_id = str(slot.get("id", ""))
-            if slot_id not in self.banks or slot_id not in self.thresholds:
-                raise RuntimeError(f"{self.name}: model is missing slot {slot_id}")
-
             roi = roi_for_image(slot["roi"], self.config, w, h)
-            crop = crop_roi(canonical_bgr, roi)
-            descriptor = appearance_descriptor(crop, self.descriptor_cfg)
-            score = nearest_cosine_distance(descriptor, self.banks[slot_id])
-            threshold = float(self.thresholds[slot_id])
-            status = "NG" if score > threshold else "PASS"
-            any_ng = any_ng or status == "NG"
-            slot_rows.append(
+            descriptor = appearance_descriptor(crop_roi(canonical_bgr, roi), self.descriptor_cfg)
+            d_screw = topk_cosine_distance(descriptor, self.screw_bank, self.top_k)
+            d_empty = topk_cosine_distance(descriptor, self.empty_bank, self.top_k)
+            margin = d_empty - d_screw  # positive => screw-like, negative => empty-like
+
+            if self.expected == "screw":
+                passed = margin >= self.threshold
+                decision = "margin >= threshold"
+            else:
+                passed = margin <= self.threshold
+                decision = "margin <= threshold"
+
+            status = "PASS" if passed else "NG"
+            any_ng = any_ng or not passed
+            rows.append(
                 {
-                    "id": slot_id,
+                    "id": str(slot.get("id", "")),
                     "expected": self.expected,
                     "status": status,
-                    "reason": self.defect_reason if status == "NG" else "",
-                    "score": score,
-                    "threshold": threshold,
+                    "reason": "" if passed else self.defect_reason,
+                    "score": float(margin),
+                    "threshold": float(self.threshold),
+                    "decision": decision,
+                    "distance_screw": float(d_screw),
+                    "distance_empty": float(d_empty),
                     "roi_canonical": roi,
                 }
             )
@@ -274,7 +229,7 @@ class _BasePresenceDetector:
             detector=self.name,
             status="NG" if any_ng else "PASS",
             reason=self.defect_reason if any_ng else "",
-            details={"slots": slot_rows},
+            details={"slots": rows},
         )
 
 
