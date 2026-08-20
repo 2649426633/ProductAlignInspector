@@ -47,6 +47,10 @@ def save_model(
     banks_dir = output_dir / "banks"
     banks_dir.mkdir(parents=True, exist_ok=True)
 
+    # Remove stale v1 banks so an old file can never be mixed with the new model.
+    for old in banks_dir.glob("*.npy"):
+        old.unlink()
+
     thresholds: dict[str, float] = {}
     slot_stats: dict[str, dict] = {}
     for slot_id, rows in banks.items():
@@ -68,16 +72,19 @@ def save_model(
 
     roi_size = config_reference_size(config)
     model = {
-        "schema_version": 1,
+        "schema_version": 2,
         "detector": detector_name,
         "expected": expected,
         "canonical_size": [int(canonical_size[0]), int(canonical_size[1])],
         "roi_coordinate_size": None if roi_size is None else [int(roi_size[0]), int(roi_size[1])],
         "descriptor": {
+            "type": "radial_presence_v2",
             "size": int(descriptor_cfg.size),
-            "gray_weight": float(descriptor_cfg.gray_weight),
-            "gradient_weight": float(descriptor_cfg.gradient_weight),
+            "center_crop_ratio": float(descriptor_cfg.center_crop_ratio),
+            "radial_bins": int(descriptor_cfg.radial_bins),
+            "hist_bins": int(descriptor_cfg.hist_bins),
             "distance": "nearest_cosine",
+            "note": "center-focused radial/structural descriptor; angular lighting direction is discarded",
         },
         "thresholds": thresholds,
         "slot_stats": slot_stats,
@@ -101,8 +108,8 @@ def save_model(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build two independent GOOD-only appearance models: S screw-present and E empty. "
-            "Training images are first aligned to the canonical reference."
+            "Build independent GOOD-only S/E models using the radial_presence_v2 descriptor. "
+            "Training images are aligned first; physically rotated lighting is handled by angular pooling."
         )
     )
     parser.add_argument("--train-good", required=True)
@@ -111,7 +118,10 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--ecc-accept", type=float, default=0.70)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.10)
-    parser.add_argument("--descriptor-size", type=int, default=40)
+    parser.add_argument("--descriptor-size", type=int, default=64)
+    parser.add_argument("--center-crop-ratio", type=float, default=0.78)
+    parser.add_argument("--radial-bins", type=int, default=10)
+    parser.add_argument("--hist-bins", type=int, default=16)
     parser.add_argument("--margin-factor", type=float, default=1.25)
     parser.add_argument("--margin-abs", type=float, default=0.002)
     args = parser.parse_args()
@@ -129,7 +139,12 @@ def main() -> None:
     if not e_slots:
         raise SystemExit("No enabled E/empty slots found in config.")
 
-    descriptor_cfg = PresenceDescriptorConfig(size=max(16, int(args.descriptor_size)))
+    descriptor_cfg = PresenceDescriptorConfig(
+        size=max(32, int(args.descriptor_size)),
+        center_crop_ratio=float(args.center_crop_ratio),
+        radial_bins=max(4, int(args.radial_bins)),
+        hist_bins=max(8, int(args.hist_bins)),
+    )
     align_cfg = ProductLocatorConfig(
         ecc_accept_score=float(args.ecc_accept),
         feature_min_inlier_ratio=float(args.min_inlier_ratio),
@@ -144,11 +159,12 @@ def main() -> None:
 
     skipped: list[dict] = []
     alignment_ok = 0
-    print("=== Build S/E GOOD-only presence models ===")
+    print("=== Build S/E GOOD-only presence models v2 ===")
     print(f"Train GOOD:      {train_root}")
     print(f"Canonical:       {canonical_w}x{canonical_h}")
     print(f"S slots:         {[slot['id'] for slot in s_slots]}")
     print(f"E slots:         {[slot['id'] for slot in e_slots]}")
+    print("Descriptor:      radial_presence_v2")
     print("Models:          S and E are built separately")
     print()
 
@@ -199,6 +215,8 @@ def main() -> None:
     )
 
     summary = {
+        "schema_version": 2,
+        "descriptor": "radial_presence_v2",
         "images_seen": len(files),
         "alignment_ok": alignment_ok,
         "alignment_skipped": len(files) - alignment_ok,
