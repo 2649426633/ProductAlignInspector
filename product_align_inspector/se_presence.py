@@ -14,8 +14,14 @@ from .roi import crop_roi, enabled_slots, roi_for_image
 
 @dataclass
 class PresenceDescriptorConfig:
+    """Local structure descriptor configuration for S/E presence inspection.
+
+    v6 intentionally suppresses absolute brightness and slow illumination changes.
+    The descriptor is still deterministic and lightweight enough to port to C#.
+    """
+
     size: int = 64
-    center_crop_ratio: float = 0.78
+    center_crop_ratio: float = 0.72
     radial_bins: int = 10
     hist_bins: int = 16
 
@@ -41,11 +47,11 @@ def _center_square(gray: np.ndarray, ratio: float) -> np.ndarray:
 
 
 def _normalize_01(values: np.ndarray, percentile: float = 95.0) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float32)
-    scale = float(np.percentile(np.abs(arr), percentile))
+    arr = np.abs(np.asarray(values, dtype=np.float32))
+    scale = float(np.percentile(arr, percentile))
     if scale <= 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
-    return np.clip(np.abs(arr) / scale, 0.0, 1.0).astype(np.float32)
+    return np.clip(arr / scale, 0.0, 1.0).astype(np.float32)
 
 
 def _hist01(values: np.ndarray, bins: int) -> np.ndarray:
@@ -61,32 +67,74 @@ def _hist01(values: np.ndarray, bins: int) -> np.ndarray:
     return hist
 
 
+def _rotation_invariant_lbp_stats(gray: np.ndarray) -> np.ndarray:
+    """Return compact LBP statistics robust to monotonic illumination changes.
+
+    Instead of a 256-bin raw LBP code histogram, v6 stores the number of bright
+    neighbours and the number of binary transitions around the centre pixel.
+    Both statistics are invariant to circular rotation of the local pattern.
+    """
+
+    padded = np.pad(gray, 1, mode="edge")
+    center = padded[1:-1, 1:-1]
+    neighbors = [
+        padded[:-2, :-2],
+        padded[:-2, 1:-1],
+        padded[:-2, 2:],
+        padded[1:-1, 2:],
+        padded[2:, 2:],
+        padded[2:, 1:-1],
+        padded[2:, :-2],
+        padded[1:-1, :-2],
+    ]
+    bits = np.stack([(n >= center).astype(np.uint8) for n in neighbors], axis=0)
+    ones = bits.sum(axis=0)
+    transitions = np.sum(bits != np.roll(bits, -1, axis=0), axis=0)
+
+    hist_ones = np.bincount(ones.reshape(-1), minlength=9).astype(np.float32)
+    hist_transitions = np.bincount(transitions.reshape(-1), minlength=9).astype(np.float32)
+    hist_ones /= max(1.0, float(hist_ones.sum()))
+    hist_transitions /= max(1.0, float(hist_transitions.sum()))
+    return np.concatenate([hist_ones, hist_transitions]).astype(np.float32)
+
+
 def appearance_descriptor(
     crop: np.ndarray,
     cfg: PresenceDescriptorConfig | None = None,
 ) -> np.ndarray:
-    """Rotation/lighting-resistant descriptor used by every individual slot."""
+    """Return an illumination-resistant structure descriptor for one S/E slot.
+
+    Important v6 change: absolute gray level is not used as a feature. We first
+    remove slow illumination with local contrast normalization, then describe only
+    residual structure, edges, Laplacian texture and rotation-invariant LBP.
+    This targets the observed case where a geometrically correct GOOD image has a
+    very different metal reflection pattern from the training images.
+    """
+
     cfg = cfg or PresenceDescriptorConfig()
     size = max(32, int(cfg.size))
     radial_bins = max(4, int(cfg.radial_bins))
     hist_bins = max(8, int(cfg.hist_bins))
 
-    gray = _gray_uint8(crop)
-    gray = _center_square(gray, cfg.center_crop_ratio)
-    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    gray = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    gray_u8 = _gray_uint8(crop)
+    gray_u8 = _center_square(gray_u8, cfg.center_crop_ratio)
+    gray_u8 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray_u8)
+    gray = cv2.resize(gray_u8, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
 
-    blur_k = max(5, int(round(size * 0.23)))
-    if blur_k % 2 == 0:
-        blur_k += 1
-    low = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
-    high = gray - low
-    high_abs = _normalize_01(high)
+    # Local contrast normalization (Retinex-like). Slow brightness/shading is
+    # removed while screw slots, hole rims and local metal structure remain.
+    sigma = max(2.0, size * 0.10)
+    low = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    residual = gray - low
+    energy = cv2.GaussianBlur(residual * residual, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    local_std = np.sqrt(np.maximum(energy, 1e-5))
+    normalized = np.clip(residual / (local_std + 1e-3), -3.0, 3.0)
+    structure = np.clip(np.abs(normalized) / 3.0, 0.0, 1.0).astype(np.float32)
 
-    gx = cv2.Scharr(high, cv2.CV_32F, 1, 0)
-    gy = cv2.Scharr(high, cv2.CV_32F, 0, 1)
-    grad = _normalize_01(cv2.magnitude(gx, gy))
-    lap = _normalize_01(cv2.Laplacian(high, cv2.CV_32F, ksize=3))
+    gx = cv2.Scharr(normalized, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(normalized, cv2.CV_32F, 0, 1)
+    grad = _normalize_01(cv2.magnitude(gx, gy), 95.0)
+    lap = _normalize_01(cv2.Laplacian(normalized, cv2.CV_32F, ksize=3), 95.0)
 
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
     cx = (size - 1) * 0.5
@@ -96,35 +144,43 @@ def appearance_descriptor(
     disk = radius <= 1.0
 
     features: list[float] = []
+
+    # Radial pooling removes angular lighting direction while retaining the
+    # centre/rim structure that distinguishes a stable screw/hole appearance.
     for i in range(radial_bins):
         r0 = i / radial_bins
         r1 = (i + 1) / radial_bins
         mask = disk & (radius >= r0) & (radius < r1)
         if not np.any(mask):
-            features.extend([0.0] * 5)
+            features.extend([0.0] * 6)
             continue
         features.extend(
             [
-                float(gray[mask].mean()),
-                float(gray[mask].std()),
-                float(high_abs[mask].mean()),
+                float(structure[mask].mean()),
+                float(structure[mask].std()),
                 float(grad[mask].mean()),
+                float(grad[mask].std()),
                 float(lap[mask].mean()),
+                float(lap[mask].std()),
             ]
         )
 
-    features.extend(_hist01(gray[disk], hist_bins).tolist())
+    features.extend(_hist01(structure[disk], hist_bins).tolist())
     features.extend(_hist01(grad[disk], hist_bins).tolist())
     features.extend(_hist01(lap[disk], hist_bins).tolist())
 
     inner = disk & (radius <= 0.30)
     middle = disk & (radius >= 0.38) & (radius <= 0.68)
     outer = disk & (radius >= 0.68) & (radius <= 0.95)
-    for channel in (gray, high_abs, grad, lap):
-        inner_mean = float(channel[inner].mean()) if np.any(inner) else 0.0
-        middle_mean = float(channel[middle].mean()) if np.any(middle) else 0.0
-        outer_mean = float(channel[outer].mean()) if np.any(outer) else 0.0
-        features.extend([inner_mean, middle_mean, outer_mean, inner_mean - middle_mean])
+    for channel in (structure, grad, lap):
+        a = float(channel[inner].mean()) if np.any(inner) else 0.0
+        b = float(channel[middle].mean()) if np.any(middle) else 0.0
+        c = float(channel[outer].mean()) if np.any(outer) else 0.0
+        features.extend([a, b, c, a - b, b - c])
+
+    # LBP uses only local ordering, not absolute brightness.
+    lbp_gray = cv2.resize(gray_u8, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    features.extend(_rotation_invariant_lbp_stats(lbp_gray).tolist())
 
     vector = np.asarray(features, dtype=np.float32)
     norm = float(np.linalg.norm(vector))
@@ -133,47 +189,14 @@ def appearance_descriptor(
     return vector
 
 
-def circular_angle_distance_deg(a: float | np.ndarray, b: float | np.ndarray) -> np.ndarray:
-    aa = np.asarray(a, dtype=np.float32)
-    bb = np.asarray(b, dtype=np.float32)
-    return np.abs((aa - bb + 180.0) % 360.0 - 180.0)
-
-
-def angle_conditioned_topk_distance(
-    vector: np.ndarray,
-    bank: np.ndarray,
-    bank_angles_deg: np.ndarray,
-    query_angle_deg: float,
-    *,
-    top_k: int = 5,
-    angle_neighbors: int = 12,
-) -> tuple[float, int, float, float]:
+def topk_cosine_distance(vector: np.ndarray, bank: np.ndarray, top_k: int = 5) -> float:
     vector = np.asarray(vector, dtype=np.float32).reshape(-1)
     bank = np.asarray(bank, dtype=np.float32)
-    angles = np.asarray(bank_angles_deg, dtype=np.float32).reshape(-1)
     if bank.ndim != 2 or bank.shape[0] == 0 or bank.shape[1] != vector.shape[0]:
         raise ValueError(f"Invalid bank shape {bank.shape} for descriptor {vector.shape}")
-    if angles.size != bank.shape[0]:
-        raise ValueError(f"Angle count {angles.size} does not match bank rows {bank.shape[0]}")
-
-    angle_diff = circular_angle_distance_deg(angles, float(query_angle_deg)).reshape(-1)
-    n_angle = max(int(top_k), min(max(1, int(angle_neighbors)), bank.shape[0]))
-    candidate_idx = np.argpartition(angle_diff, n_angle - 1)[:n_angle]
-    candidate_bank = bank[candidate_idx]
-    candidate_diff = angle_diff[candidate_idx]
-
-    distances = 1.0 - candidate_bank @ vector
+    distances = 1.0 - bank @ vector
     k = max(1, min(int(top_k), distances.size))
-    score = float(np.mean(np.partition(distances, k - 1)[:k]))
-    return score, int(candidate_idx.size), float(np.min(candidate_diff)), float(np.max(candidate_diff))
-
-
-def _runtime_rotation_deg(context: dict[str, Any]) -> float:
-    alignment = context.get("alignment") or {}
-    angle = alignment.get("rigid_rotation_deg")
-    if angle is None:
-        raise RuntimeError("S/E detector requires alignment.rigid_rotation_deg for angle-conditioned scoring.")
-    return float(angle)
+    return float(np.mean(np.partition(distances, k - 1)[:k]))
 
 
 class _BasePresenceDetector:
@@ -189,7 +212,7 @@ class _BasePresenceDetector:
             raise FileNotFoundError(f"Presence model not found: {model_path}")
 
         self.model = json.loads(model_path.read_text(encoding="utf-8"))
-        if int(self.model.get("schema_version", 0)) != 5:
+        if int(self.model.get("schema_version", 0)) != 6:
             raise RuntimeError(
                 f"{self.name}: old/incompatible S/E model. Rebuild with tools/build_se_presence_models.py."
             )
@@ -197,20 +220,19 @@ class _BasePresenceDetector:
             raise ValueError(f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}")
 
         descriptor_cfg = self.model.get("descriptor") or {}
-        if str(descriptor_cfg.get("type", "")) != "slotwise_radial_v5":
+        if str(descriptor_cfg.get("type", "")) != "slotwise_structure_v6":
             raise RuntimeError(f"{self.name}: unsupported descriptor type {descriptor_cfg.get('type')}")
 
         canonical_size = self.model.get("canonical_size")
         self.canonical_size = None if canonical_size is None else (int(canonical_size[0]), int(canonical_size[1]))
         self.descriptor_cfg = PresenceDescriptorConfig(
             size=int(descriptor_cfg.get("size", 64)),
-            center_crop_ratio=float(descriptor_cfg.get("center_crop_ratio", 0.78)),
+            center_crop_ratio=float(descriptor_cfg.get("center_crop_ratio", 0.72)),
             radial_bins=int(descriptor_cfg.get("radial_bins", 10)),
             hist_bins=int(descriptor_cfg.get("hist_bins", 16)),
         )
         classifier = self.model.get("classifier") or {}
         self.default_top_k = int(classifier.get("top_k", 5))
-        self.default_angle_neighbors = int(classifier.get("angle_neighbors", 12))
         self.threshold_profile = str(classifier.get("threshold_profile", "recommended"))
 
         slot_models = self.model.get("slots") or {}
@@ -219,19 +241,14 @@ class _BasePresenceDetector:
 
         self.slot_models: dict[str, dict[str, Any]] = {}
         for slot_id, row in slot_models.items():
-            bank_rel = str(row.get("bank", f"banks/{slot_id}.npz"))
+            bank_rel = str(row.get("bank", f"banks/{slot_id}.npy"))
             bank_path = self.model_dir / bank_rel
             if not bank_path.exists():
                 raise FileNotFoundError(f"{self.name}: bank not found for {slot_id}: {bank_path}")
-            with np.load(bank_path) as data:
-                descriptors = np.asarray(data["descriptors"], dtype=np.float32)
-                angles_deg = np.asarray(data["angles_deg"], dtype=np.float32)
             self.slot_models[str(slot_id)] = {
-                "bank": descriptors,
-                "angles_deg": angles_deg,
+                "bank": np.load(bank_path).astype(np.float32),
                 "threshold": float(row["threshold"]),
                 "top_k": int(row.get("top_k", self.default_top_k)),
-                "angle_neighbors": int(row.get("angle_neighbors", self.default_angle_neighbors)),
                 "suggested_thresholds": row.get("suggested_thresholds") or {},
                 "calibration": row.get("calibration") or {},
             }
@@ -243,7 +260,6 @@ class _BasePresenceDetector:
                 f"{self.name}: model canonical size={self.canonical_size[0]}x{self.canonical_size[1]}, runtime={w}x{h}"
             )
 
-        query_angle = _runtime_rotation_deg(context)
         rows: list[dict[str, Any]] = []
         any_ng = False
         for slot in enabled_slots(self.config, expected=self.expected):
@@ -254,14 +270,7 @@ class _BasePresenceDetector:
 
             roi = roi_for_image(slot["roi"], self.config, w, h)
             descriptor = appearance_descriptor(crop_roi(canonical_bgr, roi), self.descriptor_cfg)
-            score, candidate_count, min_angle_diff, max_angle_diff = angle_conditioned_topk_distance(
-                descriptor,
-                model["bank"],
-                model["angles_deg"],
-                query_angle,
-                top_k=model["top_k"],
-                angle_neighbors=model["angle_neighbors"],
-            )
+            score = topk_cosine_distance(descriptor, model["bank"], model["top_k"])
             threshold = float(model["threshold"])
             passed = score <= threshold
             status = "PASS" if passed else "NG"
@@ -277,12 +286,7 @@ class _BasePresenceDetector:
                     "threshold": threshold,
                     "threshold_profile": self.threshold_profile,
                     "suggested_thresholds": model["suggested_thresholds"],
-                    "decision": "angle-conditioned score <= slot_threshold",
-                    "rotation_deg": float(query_angle),
-                    "angle_neighbors": int(model["angle_neighbors"]),
-                    "candidate_count": int(candidate_count),
-                    "min_training_angle_diff_deg": float(min_angle_diff),
-                    "max_selected_angle_diff_deg": float(max_angle_diff),
+                    "decision": "illumination-invariant score <= slot_threshold",
                     "roi_canonical": roi,
                 }
             )
