@@ -65,7 +65,7 @@ def appearance_descriptor(
     crop: np.ndarray,
     cfg: PresenceDescriptorConfig | None = None,
 ) -> np.ndarray:
-    """Rotation/lighting-resistant local descriptor for screw vs empty appearance."""
+    """Rotation/lighting-resistant descriptor used by every individual slot."""
     cfg = cfg or PresenceDescriptorConfig()
     size = max(32, int(cfg.size))
     radial_bins = max(4, int(cfg.radial_bins))
@@ -138,11 +138,9 @@ def topk_cosine_distance(vector: np.ndarray, bank: np.ndarray, top_k: int = 5) -
     bank = np.asarray(bank, dtype=np.float32)
     if bank.ndim != 2 or bank.shape[0] == 0 or bank.shape[1] != vector.shape[0]:
         raise ValueError(f"Invalid bank shape {bank.shape} for descriptor {vector.shape}")
-    similarity = bank @ vector
-    distances = 1.0 - similarity
+    distances = 1.0 - bank @ vector
     k = max(1, min(int(top_k), distances.size))
-    nearest = np.partition(distances, k - 1)[:k]
-    return float(np.mean(nearest))
+    return float(np.mean(np.partition(distances, k - 1)[:k]))
 
 
 class _BasePresenceDetector:
@@ -156,15 +154,18 @@ class _BasePresenceDetector:
         model_path = self.model_dir / "model.json"
         if not model_path.exists():
             raise FileNotFoundError(f"Presence model not found: {model_path}")
+
         self.model = json.loads(model_path.read_text(encoding="utf-8"))
+        if int(self.model.get("schema_version", 0)) != 4:
+            raise RuntimeError(
+                f"{self.name}: old/incompatible S/E model. Rebuild with tools/build_se_presence_models.py."
+            )
         if str(self.model.get("expected", "")).lower() != self.expected:
             raise ValueError(f"Wrong model type: expected={self.expected}, model={self.model.get('expected')}")
 
         descriptor_cfg = self.model.get("descriptor") or {}
-        if str(descriptor_cfg.get("type", "")) != "radial_presence_v3":
-            raise RuntimeError(
-                f"{self.name}: old/incompatible S/E model. Rebuild with tools/build_se_presence_models.py."
-            )
+        if str(descriptor_cfg.get("type", "")) != "slotwise_radial_v4":
+            raise RuntimeError(f"{self.name}: unsupported descriptor type {descriptor_cfg.get('type')}")
 
         canonical_size = self.model.get("canonical_size")
         self.canonical_size = None if canonical_size is None else (int(canonical_size[0]), int(canonical_size[1]))
@@ -175,15 +176,26 @@ class _BasePresenceDetector:
             hist_bins=int(descriptor_cfg.get("hist_bins", 16)),
         )
         classifier = self.model.get("classifier") or {}
-        self.top_k = int(classifier.get("top_k", 5))
-        self.threshold = float(classifier.get("threshold", 0.0))
+        self.default_top_k = int(classifier.get("top_k", 5))
+        self.threshold_profile = str(classifier.get("threshold_profile", "recommended"))
 
-        screw_path = self.model_dir / "banks" / "screw.npy"
-        empty_path = self.model_dir / "banks" / "empty.npy"
-        if not screw_path.exists() or not empty_path.exists():
-            raise FileNotFoundError(f"{self.name}: screw/empty banks are missing in {self.model_dir / 'banks'}")
-        self.screw_bank = np.load(screw_path).astype(np.float32)
-        self.empty_bank = np.load(empty_path).astype(np.float32)
+        slot_models = self.model.get("slots") or {}
+        if not slot_models:
+            raise RuntimeError(f"{self.name}: model has no slot definitions")
+
+        self.slot_models: dict[str, dict[str, Any]] = {}
+        for slot_id, row in slot_models.items():
+            bank_rel = str(row.get("bank", f"banks/{slot_id}.npy"))
+            bank_path = self.model_dir / bank_rel
+            if not bank_path.exists():
+                raise FileNotFoundError(f"{self.name}: bank not found for {slot_id}: {bank_path}")
+            self.slot_models[str(slot_id)] = {
+                "bank": np.load(bank_path).astype(np.float32),
+                "threshold": float(row["threshold"]),
+                "top_k": int(row.get("top_k", self.default_top_k)),
+                "suggested_thresholds": row.get("suggested_thresholds") or {},
+                "calibration": row.get("calibration") or {},
+            }
 
     def inspect(self, canonical_bgr: np.ndarray, context: dict[str, Any]) -> DetectionResult:
         h, w = canonical_bgr.shape[:2]
@@ -195,32 +207,30 @@ class _BasePresenceDetector:
         rows: list[dict[str, Any]] = []
         any_ng = False
         for slot in enabled_slots(self.config, expected=self.expected):
+            slot_id = str(slot.get("id", ""))
+            model = self.slot_models.get(slot_id)
+            if model is None:
+                raise RuntimeError(f"{self.name}: model is missing slot {slot_id}")
+
             roi = roi_for_image(slot["roi"], self.config, w, h)
             descriptor = appearance_descriptor(crop_roi(canonical_bgr, roi), self.descriptor_cfg)
-            d_screw = topk_cosine_distance(descriptor, self.screw_bank, self.top_k)
-            d_empty = topk_cosine_distance(descriptor, self.empty_bank, self.top_k)
-            margin = d_empty - d_screw  # positive => screw-like, negative => empty-like
-
-            if self.expected == "screw":
-                passed = margin >= self.threshold
-                decision = "margin >= threshold"
-            else:
-                passed = margin <= self.threshold
-                decision = "margin <= threshold"
-
+            score = topk_cosine_distance(descriptor, model["bank"], model["top_k"])
+            threshold = float(model["threshold"])
+            passed = score <= threshold
             status = "PASS" if passed else "NG"
             any_ng = any_ng or not passed
+
             rows.append(
                 {
-                    "id": str(slot.get("id", "")),
+                    "id": slot_id,
                     "expected": self.expected,
                     "status": status,
                     "reason": "" if passed else self.defect_reason,
-                    "score": float(margin),
-                    "threshold": float(self.threshold),
-                    "decision": decision,
-                    "distance_screw": float(d_screw),
-                    "distance_empty": float(d_empty),
+                    "score": float(score),
+                    "threshold": threshold,
+                    "threshold_profile": self.threshold_profile,
+                    "suggested_thresholds": model["suggested_thresholds"],
+                    "decision": "score <= slot_threshold",
                     "roi_canonical": roi,
                 }
             )
