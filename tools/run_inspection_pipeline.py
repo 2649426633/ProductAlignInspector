@@ -15,7 +15,11 @@ from product_align_inspector.alignment import ProductLocatorConfig
 from product_align_inspector.inspection_pipeline import InspectionPipeline
 from product_align_inspector.io_utils import read_image
 from product_align_inspector.roi import config_reference_size, enabled_slots, roi_for_image, validate_roi
-from product_align_inspector.se_presence import EEmptyDetector, SPresenceDetector
+from product_align_inspector.se_presence import (
+    EEmptyDetector,
+    SPresenceDetector,
+    SharedSemanticPresenceModel,
+)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -53,11 +57,28 @@ def validate_config(config: dict, reference_width: int, reference_height: int) -
     return note
 
 
+def _resolve_semantic_models(args: argparse.Namespace) -> tuple[Path | None, Path | None, Path | None]:
+    """Resolve new shared model CLI while retaining a narrow compatibility path."""
+
+    if args.se_model:
+        shared = Path(args.se_model).resolve()
+        if args.s_model or args.e_model:
+            raise SystemExit("Use --se-model alone; do not combine it with --s-model/--e-model.")
+        return shared, shared, shared
+
+    s_model = None if not args.s_model else Path(args.s_model).resolve()
+    e_model = None if not args.e_model else Path(args.e_model).resolve()
+    if s_model is not None and e_model is not None and s_model == e_model:
+        return s_model, s_model, s_model
+    return None, s_model, e_model
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "RAW -> canonical reference -> independent S/E detectors -> inverse-map results to RAW. "
-            "Per-frame geometry is rigid only: rotation + X/Y translation, scale=1."
+            "RAW -> rigid canonical reference -> shared semantic screw/empty CNN -> "
+            "11 per-slot probability thresholds -> inverse-map results to RAW. "
+            "Per-frame geometry is rotation + X/Y translation only, scale=1."
         )
     )
     parser.add_argument("--input-root", required=True)
@@ -70,8 +91,21 @@ def main() -> None:
         "--config",
         help="ROI JSON, e.g. configs/brunei_preview_template.json",
     )
-    parser.add_argument("--s-model", help="S screw-present model directory")
-    parser.add_argument("--e-model", help="E empty model directory")
+    parser.add_argument(
+        "--se-model",
+        help=(
+            "Shared semantic S/E model directory containing model.json + presence_classifier.onnx. "
+            "Enables both S_presence and E_empty."
+        ),
+    )
+    parser.add_argument(
+        "--s-model",
+        help="Compatibility option: semantic model directory for S only. Prefer --se-model.",
+    )
+    parser.add_argument(
+        "--e-model",
+        help="Compatibility option: semantic model directory for E only. Prefer --se-model.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--ecc-accept", type=float, default=0.70)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.10)
@@ -88,14 +122,17 @@ def main() -> None:
     reference = read_image(reference_path)
     ref_h, ref_w = reference.shape[:2]
 
+    shared_dir, s_model_dir, e_model_dir = _resolve_semantic_models(args)
+    any_model = shared_dir or s_model_dir or e_model_dir
+
     config = None
     config_note = "OFF"
     if args.config:
         config_path = Path(args.config).resolve()
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config_note = validate_config(config, ref_w, ref_h)
-    elif args.s_model or args.e_model:
-        raise SystemExit("--config is required when S/E models are enabled.")
+    elif any_model:
+        raise SystemExit("--config is required when S/E semantic detection is enabled.")
 
     align_cfg = ProductLocatorConfig(
         ecc_accept_score=float(args.ecc_accept),
@@ -104,10 +141,19 @@ def main() -> None:
     )
 
     detectors = []
-    if args.s_model:
-        detectors.append(SPresenceDetector(Path(args.s_model).resolve(), config or {}))
-    if args.e_model:
-        detectors.append(EEmptyDetector(Path(args.e_model).resolve(), config or {}))
+    if shared_dir is not None:
+        shared_model = SharedSemanticPresenceModel(shared_dir)
+        detectors.append(
+            SPresenceDetector(shared_dir, config or {}, shared_model=shared_model)
+        )
+        detectors.append(
+            EEmptyDetector(shared_dir, config or {}, shared_model=shared_model)
+        )
+    else:
+        if s_model_dir is not None:
+            detectors.append(SPresenceDetector(s_model_dir, config or {}))
+        if e_model_dir is not None:
+            detectors.append(EEmptyDetector(e_model_dir, config or {}))
 
     pipeline = InspectionPipeline(
         reference=reference,
@@ -144,9 +190,14 @@ def main() -> None:
     print(f"Images:           {len(files)}")
     print("Geometry:         rotation + X/Y translation ONLY")
     print("Scale:            FIXED 1.00000")
-    print(f"S detector:       {Path(args.s_model).resolve() if args.s_model else 'OFF'}")
-    print(f"E detector:       {Path(args.e_model).resolve() if args.e_model else 'OFF'}")
-    print("Flow: RAW -> canonical -> S/E -> inverse-map result to RAW")
+    if shared_dir is not None:
+        print(f"Shared S/E CNN:    {shared_dir}")
+        print("S/E score:         P(screw)")
+        print("Thresholds:        11 independent slot thresholds")
+    else:
+        print(f"S detector:       {s_model_dir if s_model_dir else 'OFF'}")
+        print(f"E detector:       {e_model_dir if e_model_dir else 'OFF'}")
+    print("Flow: RAW -> canonical -> semantic S/E -> inverse-map result to RAW")
     print("Alignment failure: SKIP_ALIGNMENT + log; detectors are not executed")
     print()
 
@@ -182,8 +233,22 @@ def main() -> None:
                     "tx": record.tx,
                     "ty": record.ty,
                     "ecc": record.alignment_ecc,
-                    "S_status": next((d.get("status", "") for d in record.detections if d.get("detector") == "S_presence"), ""),
-                    "E_status": next((d.get("status", "") for d in record.detections if d.get("detector") == "E_empty"), ""),
+                    "S_status": next(
+                        (
+                            d.get("status", "")
+                            for d in record.detections
+                            if d.get("detector") == "S_presence"
+                        ),
+                        "",
+                    ),
+                    "E_status": next(
+                        (
+                            d.get("status", "")
+                            for d in record.detections
+                            if d.get("detector") == "E_empty"
+                        ),
+                        "",
+                    ),
                     "alignment_time_sec": record.alignment_time_sec,
                     "total_time_sec": record.total_time_sec,
                     "canonical_path": record.canonical_path,
@@ -221,6 +286,8 @@ def main() -> None:
         "canonical_size": [ref_w, ref_h],
         "roi_config": str(Path(args.config).resolve()) if args.config else None,
         "roi_mapping": config_note,
+        "shared_se_model": str(shared_dir) if shared_dir else None,
+        "score_semantics": "P(screw)" if any_model else None,
         "detectors": {
             name: dict(counter) for name, counter in detector_counts.items()
         },
